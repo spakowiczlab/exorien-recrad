@@ -1,0 +1,3 @@
+{
+  "KIM_HYPOXIA" : {"systematicName":"M1496","pmid":"14499499","exactSource":"Table 3","geneSymbols":["ALDOA","ALDOC","AMPD3","ANGPTL4","BACH1","BNIP3L","ENO2","F3","GYS1","JUN","LDHA","PDLIM4","PFKP","PLIN2","SLC2A1","TPI1","VEGFA"],"msigdbURL":"https://www.gsea-msigdb.org/gsea/msigdb/cards/KIM_HYPOXIA","externalDetailsURL":[],"filteredBySimilarity":[],"externalNamesForSimilarTerms":[]}
+}

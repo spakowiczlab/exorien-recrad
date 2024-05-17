@@ -1,0 +1,111 @@
+---
+title: "compare mouse and human results"
+author: "Rebecca Hoyd"
+date: "5/26/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+```
+
+# Load data
+
+```{r}
+# For mouse, positive fold change is enriched in high buffa samples. I should really start annotating this in all model summary objects as we later pull the results for comparisons fairly often.
+mouse.results <- read.csv(
+  "../data/deseq2_mouse_atov-dmso_RNASeq_hypox-lab.csv"
+)
+
+# For updated human results, positive fold change is enriched in high buffa samples.
+tcga.res <- read.csv("../data/deseq2_tcga_fix-dir_vis.csv",
+                     stringsAsFactors = F) %>%
+  rename("microbe" = "X")
+ORIEN.res <- read.csv("../data/deseq2_exotic-GI.csv",
+                      stringsAsFactors = F) %>%
+  mutate(source = "ORIEN") %>%
+  rename("microbe" = "X")
+```
+
+# Formatting
+
+```{r}
+formatHumanResults <- function(){
+  tcga.forjoin <- tcga.res %>%
+    mutate(source = "TCGA") %>%
+    dplyr::select(microbe, log2FoldChange, pvalue, source) %>%
+    mutate(miclab = ifelse(pvalue < 0.05, source, NA))
+  
+  dircheck <- bind_rows(ORIEN.res, tcga.forjoin) %>%
+    mutate(dir = ifelse(log2FoldChange < 0, "neg", "pos")) %>%
+    select(microbe, source, dir) %>%
+    spread(key = "source", value = "dir") %>%
+    filter(TCGA == ORIEN)
+  consistentspecs <- dircheck$microbe
+  
+  human.sig <- 
+    bind_rows(ORIEN.res, tcga.forjoin) %>%
+    mutate(enriched.in = ifelse(log2FoldChange > 0, "HighBuffa", "LowBuffa"),
+           sigcode = pvalue < 0.05) %>%
+    select(microbe, enriched.in, source, sigcode) %>%
+    pivot_wider(names_from = source,values_from = sigcode) %>%
+    filter(microbe %in% consistentspecs & (TCGA == T | ORIEN == T))
+    # distinct()
+  
+  return(human.sig)
+}
+
+human.sig <- formatHumanResults()
+```
+
+```{r}
+mouse.sig <- 
+  mouse.results %>%
+    filter(pvalue < 0.05) %>%
+    mutate(enriched.in = ifelse(log2FoldChange > 0, "HighBuffa", "LowBuffa"),
+           X = make.names(gsub("\\w__", "", Taxa))) %>%
+    select(X, enriched.in, mouse.line) %>%
+    distinct() %>%
+  rename("microbe" = "X")
+    
+```
+
+# Check overlap
+
+```{r}
+full.agree <- inner_join(human.sig, mouse.sig)
+
+full.agree
+
+
+```
+
+# Pull complete models for supplement
+
+```{r}
+tcga.res.filt <- tcga.res %>%
+  filter(X %in% full.agree$X) %>%
+  mutate(enriched.in = ifelse(log2FoldChange < 0, "HighBuffa", "LowBuffa"),
+         dataset = "TCGA") %>%
+  select(-threshold)
+
+orien.res.filt <- ORIEN.res %>%
+  filter(X %in% full.agree$X) %>%
+  mutate(enriched.in = ifelse(log2FoldChange < 0, "HighBuffa", "LowBuffa"),
+         dataset = "ORIEN") %>%
+  select(-miclab, -source)
+
+mouse.res.filt <- mouse.results %>%
+  mutate(X = make.names(gsub("\\w__", "", Taxa))) %>%
+  filter(X %in% full.agree$X) %>%
+  select(-Taxa, -TaxLev) %>%
+  mutate(enriched.in = ifelse(log2FoldChange > 0, "HighBuffa", "LowBuffa"),
+         dataset = "Mouse")
+
+suptab <- bind_rows(tcga.res.filt, orien.res.filt, mouse.res.filt)
+write.csv(suptab, "../tables/comparisons_mouse-human-agree.csv", row.names = F)
+```
+
+

@@ -1,0 +1,3 @@
+{
+  "FARDIN_HYPOXIA_11" : {"systematicName":"M2345","pmid":"20624283","exactSource":"Fig. 2","geneSymbols":["AK4","ALDOC","ANGPTL4","ANKRD37","BHLHE40","BNIP3","BNIP3L","BTG1","DDIT4","EGLN1","EGLN3","FAM162A","FUT11","IGF1R","IGFBP3","KDM3A","MAPT","MTFP1","MXI1","NDRG1","P4HA2","PDK1","PFKFB4","PGK1","PGM1","PLOD1","SLC2A3","TNIP1","TPI1","TXNIP","VEGFA","ZNF395"],"msigdbURL":"https://www.gsea-msigdb.org/gsea/msigdb/cards/FARDIN_HYPOXIA_11","externalDetailsURL":[],"filteredBySimilarity":[],"externalNamesForSimilarTerms":[]}
+}

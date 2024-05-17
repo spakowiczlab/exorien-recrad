@@ -1,0 +1,234 @@
+---
+title: "Immune cell infiltrate"
+author: "Rebecca Hoyd"
+date: "11/1/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(vegan)
+library(readxl)
+```
+
+# Load data
+
+```{r}
+radiation <- read.csv("/fs/ess/PAS1695/projects/exorien/data/clinical/20PRJ060OSU_20210712_Radiation_V4.csv", stringsAsFactors = F)
+
+Linkage <- read_excel("/fs/ess/PAS1695/projects/exorien/data/clinical/20PRJ060OSU_20210707_ClinicalMolLinkage_V4_as-in-drake.xlsx") %>%
+  # rename("ORIENAvatarKey" = "AvatarKey")
+  rename("AvatarKey" = "ORIENAvatarKey")
+
+# clin_vit <- read.csv("/fs/ess/PAS1695/projects/exorien/data/clinical/20PRJ060OSU_20210712_VitalStatus_V4.csv")
+tme <- read.csv("../data/TME_calculated-signatures.csv", stringsAsFactors = F)
+
+imcell <- read.csv("/fs/ess/PAS1695/projects/exorien/data/cibersort/2022-03-16_immunecell_composition.csv")
+mics <- read.csv("/fs/ess/PAS1695/projects/exorien/data/drake-output/2022-03-16/2022-03-16_unnormalized-microbes.csv")
+```
+
+# Format
+
+```{r}
+# Get the radiation portion of clinical data
+rad <- inner_join(Linkage,radiation, by = "AvatarKey")%>%
+  rename("agec" = "Age At Specimen Collection","ager" = "AgeAtRadiationStart",
+         "PM" = "Primary/Met", "Dose" = "RadDose", "Cancer" = "TCGA.code",
+         "flag" = "RadiationTherapyInd", "sample" = "RNASeq")%>%
+  mutate(ager = ifelse(grepl("Age", ager), 90, 
+                       ifelse(grepl("Unknown",ager),0, ager)),
+         agec = ifelse(grepl("Age", agec), 90, agec),
+         agec = as.numeric(agec),
+         r2c = abs(as.numeric(ager)-as.numeric(agec)),
+         Rad_status = ifelse(grepl("No", flag), "No",
+                      ifelse(grepl("Mig", flag)|grepl("Unk", Dose), "Unknown", "Yes")),
+         Dose = ifelse(grepl("Unknown", Dose),0,
+                       ifelse(as.numeric(Dose) > 8887, NA, as.numeric(Dose))))%>%
+  select(AvatarKey, sample, agec, Cancer,PM, r2c, Rad_status, Dose,flag)%>%
+  group_by(AvatarKey)%>%
+  # filter(PM == "Primary")%>%
+  arrange(r2c)%>%
+  slice_head()%>%
+  ungroup()%>%
+  rename("Age" = "agec")
+
+# Combine clinical
+ORIEN.clin <- rad %>%
+  filter(Rad_status == "Yes" & Cancer %in% c("READ", "COAD")) %>%
+  left_join(tme)
+
+orien.buffalow <- quantile(ORIEN.clin$buffa.score, .3333)
+orien.buffahigh <- quantile(ORIEN.clin$buffa.score, .6666)
+
+ORIEN.coldat <- ORIEN.clin %>%
+  mutate(buffa.bin = case_when(buffa.score <= orien.buffalow ~ "Low",
+                               buffa.score > orien.buffahigh ~ "High")) %>%
+  select(sample, buffa.bin) %>%
+  drop_na() %>%
+  mutate(buffa.bin = fct_relevel(buffa.bin, "Low"))
+```
+
+```{r}
+lapply(imcell[, 3:24], shapiro.test)
+```
+
+```{r}
+modin <- imcell %>%
+  select(-X,-RMSE,-P.value,-Correlation, -Plasma.cells) %>%
+  mutate(TILs = rowSums(across(where(is.numeric)))) %>%
+  inner_join(ORIEN.coldat)
+
+write.csv(modin, "../data/modelData_immune-buffa.csv", row.names = F)
+
+imcells <- colnames(modin)[2:23]
+
+```
+
+# Tests
+
+Monocytes are closest to significant
+```{r}
+res.kw <- lapply(imcells, function(x) try(kruskal.test(formula = as.formula(paste0(x, " ~ buffa.bin")),
+                                                   data = modin)))
+
+res.kw
+```
+
+```{r}
+names(res.kw) <- imcells
+res.df <- lapply(imcells, function(x) broom::tidy(res.kw[[x]]) %>%
+         mutate(ImmuneCell = x)) %>%
+  bind_rows() %>%
+  mutate(padj = p.adjust(p.value, method = "fdr")) %>%
+  arrange(padj)
+
+head(res.df)
+
+write.csv(res.df, "../tables/sup_kruskal_human-immune.csv", row.names = F)
+```
+
+# Visualizations
+
+## Boxplot monocytes
+
+```{r}
+modin %>%
+  ggplot(aes(x = buffa.bin, y = Monocytes)) +
+  geom_boxplot() +
+  theme_bw()
+ggsave("../figures/boxplot_monocytes.png")
+```
+
+```{r}
+quickbox <- function(celltype){
+  modin %>%
+    rename("choosecell" := !!celltype) %>%
+    ggplot(aes(x = buffa.bin, y = choosecell)) +
+    geom_boxplot() +
+    labs(y = celltype) +
+    theme_bw()
+  ggsave(filename = paste0("../figures/boxplots/boxplot_", celltype, ".png"))
+}
+
+lapply(imcells, quickbox)
+```
+
+## Boxplots facetted
+
+```{r}
+sig.cells <- res.df %>%
+  filter(padj < 0.05)
+
+plotdat.facet <- modin %>%
+  select(sample, sig.cells$ImmuneCell, buffa.bin) %>%
+  pivot_longer(sig.cells$ImmuneCell, names_to = "imcell", values_to = "ra")
+
+plotdat.facet %>%
+  filter(imcell != "T.cells.regulatory..Tregs.") %>%
+  ggplot(aes(x = imcell, fill = buffa.bin, y = ra)) +
+  # facet_wrap(vars(imcell),ncol = 2, scales = "free_y") +
+  geom_boxplot(show.legend = F) +
+  scale_fill_brewer(palette = "Set1", name = "Hypoxia") +
+  labs(x = "",  y = "Cell abundance") +
+  theme_bw() +
+  theme(text = element_text(size = 9),
+        axis.text.x = element_text(angle = 10, hjust = 1),
+        legend.position = "top")
+ggsave("../figures/boxplot_hypoxia-immune_human.png", height = 2, width = 4)
+```
+
+## Heatmap cells
+
+```{r}
+imcells.forclust <- modin %>%
+  select(-TILs) %>%
+  select(-buffa.bin) %>%
+  column_to_rownames(var = "sample")
+
+sampord <- imcells.forclust %>%
+  dist() %>%
+  hclust()
+sampord.v <- sampord$labels[sampord$order]
+
+cellord <- imcells.forclust %>%
+  t() %>%
+  dist() %>%
+  hclust()
+cellord.v <- cellord$labels[cellord$order]
+```
+
+```{r}
+plot(sampord)
+
+```
+
+```{r}
+modin %>%
+  pivot_longer(imcells, names_to = "ImmunCell", values_to = "fraction") %>%
+  filter(ImmunCell != "TILs") %>%
+  ggplot(aes(x = fct_relevel(ImmunCell, cellord.v), y = fct_relevel(sample, sampord.v), fill = fraction)) +
+  geom_tile() +
+  labs(x = "", y = "") +
+  scale_fill_viridis_c() +
+  scale_y_discrete(breaks = modin$sample, labels = modin$buffa.bin) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+ggsave("../figures/heatmap_immune-cells.png")
+```
+
+# Correlations with consistent mics
+
+```{r}
+Hs.counts <- mics %>%
+  select(sample, Homo.sapiens) 
+
+goodmics <- c("Bacteroides.fragilis", "Pichia.kudriavzevii")
+selmics <- mics %>%
+  select("sample", goodmics) %>%
+  pivot_longer(goodmics, names_to = "microbe", values_to = "counts") %>%
+  left_join(Hs.counts) %>%
+  mutate(ra = counts/Homo.sapiens) %>%
+  select(sample, microbe, ra) %>%
+  pivot_wider(names_from = "microbe", values_from = "ra")
+
+modin.mics <- modin %>%
+  left_join(selmics)
+
+write.csv(modin.mics, "../data/modelData_immune-microbes.csv", row.names = F)
+```
+
+```{r}
+res.mics <- lapply(imcells, function(x) lapply(goodmics, function(y) 
+  try(cor.test(modin.mics[[x]], modin.mics[[y]], method = "spearman") %>%
+        broom::tidy() %>%
+        mutate(microbe = y, imcell = x))
+))
+
+res.mics.df <- bind_rows(lapply(res.mics, bind_rows)) %>%
+  mutate(padj = p.adjust(p.value, method = "fdr")) %>%
+  arrange(padj)
+
+write.csv(res.mics.df, "../data/correlations_microbes-immune.csv")
+```

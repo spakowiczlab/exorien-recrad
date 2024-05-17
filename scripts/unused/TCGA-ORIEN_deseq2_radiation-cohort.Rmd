@@ -1,0 +1,377 @@
+---
+title: "TCGA-ORIEN deseq2"
+author: "Rebecca Hoyd"
+date: "11/6/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(DESeq2)
+library(ggrepel)
+library(exoticpackage)
+library(readxl)
+```
+
+# Load data
+
+```{r ORIEN files}
+radiation <- read.csv("/fs/ess/PAS1695/projects/exorien/data/clinical/20PRJ060OSU_20210712_Radiation_V4.csv", stringsAsFactors = F)
+
+Linkage <- read_excel("/fs/ess/PAS1695/projects/exorien/data/clinical/20PRJ060OSU_20210707_ClinicalMolLinkage_V4_as-in-drake.xlsx") %>%
+  rename("ORIENAvatarKey" = "AvatarKey")
+  # rename("AvatarKey" = "ORIENAvatarKey")
+
+# clin_vit <- read.csv("/fs/ess/PAS1695/projects/exorien/data/clinical/20PRJ060OSU_20210712_VitalStatus_V4.csv")
+tme <- read.csv("../data/TME_calculated-signatures.csv", stringsAsFactors = F)
+orien.mics <- read.table("/fs/ess/PAS1695/projects/exorien/data/drake-output/2022-03-16/intermediate/k2bout_ORIEN.txt", header = T, sep = "\t")
+```
+
+```{r TCGA files}
+tcga.clin <- read.csv("/fs/ess/PAS1695/projects/recrad/data/buffa_hypoxia_score.csv")
+
+# tcga.coad <- read.table("/fs/ess/PAS1695/projects/exorien/data/drake-output/2022-03-16/intermediate/k2bout_COAD.txt", sep = "\t", header = T)
+tcga.read <- read.table("/fs/ess/PAS1695/projects/exorien/data/drake-output/2022-03-16/intermediate/k2bout_READ.txt", sep = "\t", header = T)
+```
+
+# Formatting
+
+```{r}
+try(transcript_genome_filter())
+```
+
+```{r TCGA formatting}
+tcga.clin.filt <- tcga.clin %>%
+  drop_na(buffa_hi_lo) %>%
+  mutate(buffa_hi_lo = fct_relevel(buffa_hi_lo, "low"))
+cond <- colSums(tcga.read != 0) > 2
+tcga.read.filt <- tcga.read[, cond, drop = FALSE] %>%
+  select(-any_of(humanRNA$name)) %>%
+  column_to_rownames(var = "sample")
+
+#transpose
+species <- as.data.frame(t(tcga.read.filt))
+
+species.sampord <- species %>%
+  dplyr::select(tcga.clin.filt$sample)
+
+
+```
+
+```{r ORIEN clinical formatting}
+# Get the radiation portion of clinical data
+rad <- inner_join(Linkage,radiation, by = "AvatarKey")%>%
+  rename("Age At Specimen Collection" = "agec",
+         "AgeAtRadiationStart" = "ager",
+         "Primary/Met" = "PM",
+         "RadDose" = "Dose",
+         "TCGA.code" = "Cancer",
+         "RadiationTherapyInd" = "flag",
+         "RNASeq" = "sample")%>%
+  mutate(ager = ifelse(grepl("Age", ager), 90, 
+                       ifelse(grepl("Unknown",ager),0, ager)),
+         agec = ifelse(grepl("Age", agec), 90, agec),
+         agec = as.numeric(agec),
+         r2c = abs(as.numeric(ager)-as.numeric(agec)),
+         Rad_status = ifelse(grepl("No", flag), "No",
+                      ifelse(grepl("Mig", flag)|grepl("Unk", Dose), "Unknown", "Yes")),
+         Dose = ifelse(grepl("Unknown", Dose),0,
+                       ifelse(as.numeric(Dose) > 8887, NA, as.numeric(Dose))))%>%
+  select(AvatarKey, sample, agec, Cancer,PM, r2c, Rad_status, Dose,flag)%>%
+  group_by(AvatarKey)%>%
+  # filter(PM == "Primary")%>%
+  arrange(r2c)%>%
+  slice_head()%>%
+  ungroup()%>%
+  rename("agec" = "Age")
+
+# Get the survival portion of clinical data
+# surv <- Linkage %>%
+#   select(AvatarKey, RNASeq, `Age At Specimen Collection`) %>%
+#   left_join(clin_vit) %>%
+#   mutate(AgeAtFirstContact = as.numeric(ifelse(grepl("o", `Age At Specimen Collection`),
+#                                                NA, `Age At Specimen Collection`)),
+#          AgeAtLastContact = as.numeric(ifelse(grepl("o", AgeAtLastContact), NA, AgeAtLastContact)),
+#          YearsToLC = AgeAtLastContact - AgeAtFirstContact,
+#          days = YearsToLC*365.25,
+#          vitalstatus = ifelse(VitalStatus == "Dead", 1, 0),
+#          sample = RNASeq) %>%
+#   select(AvatarKey,sample, days, vitalstatus)
+
+# Combine clinical
+ORIEN.clin <- rad %>%
+  filter(Rad_status == "Yes" & Cancer %in% c("READ", "COAD")) %>%
+  left_join(tme)
+
+orien.buffalow <- quantile(ORIEN.clin$buffa.score, .3333)
+orien.buffahigh <- quantile(ORIEN.clin$buffa.score, .6666)
+
+ORIEN.coldat <- ORIEN.clin %>%
+  mutate(buffa.bin = case_when(buffa.score <= orien.buffalow ~ "Low",
+                               buffa.score > orien.buffahigh ~ "High")) %>%
+  select(sample, buffa.bin) %>%
+  drop_na() %>%
+  mutate(buffa.bin = fct_relevel(buffa.bin, "Low"))
+```
+
+```{r ORIEN clinical full cohort}
+orien.fc <- Linkage %>%
+  filter(TCGA.code %in% c("COAD", "READ")) %>%
+  rename("RNASeq" = "sample") %>%
+  left_join(tme) 
+
+orien.buffalow.fc <- quantile(orien.fc$buffa.score, .3333)
+orien.buffahigh.fc <- quantile(orien.fc$buffa.score, .6666)
+
+ORIEN.coldat.fc <- orien.fc %>%
+  mutate(buffa.bin = case_when(buffa.score <= orien.buffalow.fc ~ "Low",
+                               buffa.score > orien.buffahigh.fc ~ "High")) %>%
+  select(sample, buffa.bin) %>%
+  drop_na() %>%
+  mutate(buffa.bin = fct_relevel(buffa.bin, "Low"))
+```
+
+```{r ORIEN microbe formatting}
+orien.coundat <- orien.mics %>%
+  select(-any_of(humanRNA$name)) %>%
+  column_to_rownames(var = "sample") %>%
+  t() %>%
+  as.data.frame() %>%
+  select(ORIEN.coldat$sample)
+
+orien.coundat.fc <- orien.mics %>%
+  select(-any_of(humanRNA$name)) %>%
+  column_to_rownames(var = "sample") %>%
+  t() %>%
+  as.data.frame() %>%
+  select(ORIEN.coldat.fc$sample)
+```
+
+# DESeq2 analyses
+
+```{r TCGA deseq2}
+dds.tcga <- DESeqDataSetFromMatrix(countData = species.sampord,
+                              colData = tcga.clin.filt,
+                              design = ~ buffa_hi_lo)
+dds.tcga <- DESeq(dds.tcga)
+res.tcga <- results(dds.tcga) %>%
+  as.data.frame() %>% 
+  mutate(threshold = padj < 0.05,
+         enriched.in = ifelse(log2FoldChange < 0, "HypoxiaLow", "HypoxiaHigh")) %>%
+  rownames_to_column(var = "microbe")
+
+write.csv(res.tcga, "../data/deseq2_tcga_fix-dir.csv", row.names = F)
+```
+
+```{r ORIEN deseq2}
+dds.orien <- DESeqDataSetFromMatrix(countData = orien.coundat,
+                              colData = ORIEN.coldat,
+                              design = ~ buffa.bin)
+dds.orien <- DESeq(dds.orien)
+res.orien <- results(dds.orien) %>%
+  as.data.frame() %>% 
+  mutate(threshold = padj < 0.05,
+         enriched.in = ifelse(log2FoldChange < 0, "HypoxiaLow", "HypoxiaHigh")) %>%
+  rownames_to_column(var = "microbe")
+
+write.csv(res.orien, "../data/deseq2_orien_fix-dir.csv", row.names = F)
+```
+
+```{r ORIEN deseq2}
+dds.orien.fc <- DESeqDataSetFromMatrix(countData = orien.coundat.fc,
+                              colData = ORIEN.coldat.fc,
+                              design = ~ buffa.bin)
+dds.orien.fc <- DESeq(dds.orien.fc)
+res.orien.fc <- results(dds.orien.fc) %>%
+  as.data.frame() %>% 
+  mutate(threshold = padj < 0.05,
+         enriched.in = ifelse(log2FoldChange < 0, "HypoxiaLow", "HypoxiaHigh")) %>%
+  rownames_to_column(var = "microbe")
+
+write.csv(res.orien.fc, "../data/deseq2_orien_fix-dir_fc.csv", row.names = F)
+```
+
+# Visualizations 
+
+## Supp table of all deseq results
+
+```{r}
+tcga.res <- read.csv("../data/deseq2_tcga_fix-dir.csv", stringsAsFactors = F)
+ORIEN.res <- read.csv("../data/deseq2_orien_fix-dir.csv")
+
+tcga.forjoin <- tcga.res %>%
+  mutate(source = "TCGA") 
+ORIEN.forjoin <- ORIEN.res %>%
+  mutate(source = "ORIEN")
+
+
+volplot.in <- bind_rows(tcga.forjoin, ORIEN.forjoin)
+write.csv(volplot.in, "../tables/sup_DESeq2_buffa_TCGA-ORIEN_fixdir.csv", row.names = F)
+```
+
+## Check total numbers of sig in each group
+
+```{r}
+volplot.in <- read.csv("../tables/sup_DESeq2_buffa_TCGA-ORIEN_fixdir.csv")
+volplot.in %>%
+  filter(pvalue < 0.05) %>%
+  mutate(enriched.in = ifelse(log2FoldChange > 0, "lowBuffa", "highBuffa")) %>%
+  group_by(source, enriched.in) %>%
+  tally()
+```
+
+## Volcano plot
+
+```{r}
+volplot.in %>%
+  mutate(miclab = ifelse(pvalue < 0.05, source, NA)) %>%
+  # dplyr::filter(X != "Salmonella.enterica") %>%
+  mutate(textlab = ifelse(!is.na(miclab), microbe, NA)) %>%
+  ggplot(aes(x = log2FoldChange, y = -log(pvalue), color = miclab, label = textlab)) +
+  geom_point() +
+  geom_text_repel(size = 2) +
+  scale_color_manual(breaks = c("ORIEN", "TCGA"), values = c("red3", "cornflowerblue"), name = "", 
+                     na.value = "grey50") +
+  theme_bw() +
+  theme(text = element_text(size = 9))
+ggsave("../figures/volcano_buffa-deseq_orien-tcga.png", height = 3, width = 6)
+```
+
+## Effect size
+
+```{r}
+dircheck <- volplot.in %>%
+  mutate(dir = ifelse(log2FoldChange < 0, "neg", "pos")) %>%
+  select(microbe, source, dir) %>%
+  spread(key = "source", value = "dir") %>%
+  filter(TCGA == ORIEN)
+consistenspecs <- dircheck$microbe
+```
+
+```{r}
+bigeffect.neg <- volplot.in %>%
+  filter(pvalue < 0.05 & microbe %in% consistenspecs) %>%
+  arrange(log2FoldChange)
+bigeffect.pos <- volplot.in %>%
+  filter(pvalue < 0.05 & microbe %in% consistenspecs) %>%
+  arrange(desc(log2FoldChange))
+
+bigeffect.spec <- unique(c(bigeffect.neg$microbe[1:5], bigeffect.pos$microbe[1:5]))
+
+effectplot.in <- volplot.in %>%
+  filter(microbe %in% bigeffect.spec) %>%
+  arrange(desc(log2FoldChange))
+
+effectplot.ord <- effectplot.in %>%
+  filter(source == "TCGA") %>%
+  arrange(log2FoldChange)
+effectplot.ord <- effectplot.ord$microbe
+```
+
+```{r}
+effectplot.in %>%
+  ggplot(aes(x =fct_relevel(microbe, effectplot.ord), y = log2FoldChange, fill = source)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(breaks = c("ORIEN", "TCGA"), values = c("red3", "cornflowerblue"), name = "") +
+  scale_x_discrete(breaks = effectplot.ord, labels = gsub("\\.", "\n", effectplot.ord)) +
+  coord_flip() +
+  labs(x = "") +
+  theme_bw() +
+  theme(text = element_text(size = 9))
+  
+ggsave("../figures/effectsize_buffa-deseq_orien-and-tcga.png", height = 3, width = 5)
+```
+
+# Visualizations - ORIEN full cohort
+
+## Supp table of all deseq results
+
+```{r}
+tcga.res <- read.csv("../data/deseq2_tcga_fix-dir.csv", stringsAsFactors = F)
+ORIEN.res <- read.csv("../data/deseq2_orien_fix-dir_fc.csv")
+
+tcga.forjoin <- tcga.res %>%
+  mutate(source = "TCGA") 
+ORIEN.forjoin <- ORIEN.res %>%
+  mutate(source = "ORIEN")
+
+
+volplot.in <- bind_rows(tcga.forjoin, ORIEN.forjoin)
+write.csv(volplot.in, "../tables/sup_DESeq2_buffa_TCGA-ORIEN_fixdir_fc.csv", row.names = F)
+```
+
+## Check total numbers of sig in each group
+
+```{r}
+volplot.in <- read.csv("../tables/sup_DESeq2_buffa_TCGA-ORIEN_fixdir_fc.csv")
+volplot.in %>%
+  filter(pvalue < 0.05) %>%
+  mutate(enriched.in = ifelse(log2FoldChange > 0, "lowBuffa", "highBuffa")) %>%
+  group_by(source, enriched.in) %>%
+  tally()
+```
+
+## Volcano plot
+
+```{r}
+volplot.in %>%
+  mutate(miclab = ifelse(pvalue < 0.05, source, NA)) %>%
+  # dplyr::filter(X != "Salmonella.enterica") %>%
+  mutate(textlab = ifelse(!is.na(miclab), microbe, NA)) %>%
+  ggplot(aes(x = log2FoldChange, y = -log(pvalue), color = miclab, label = textlab)) +
+  geom_point() +
+  geom_text_repel(size = 2) +
+  scale_color_manual(breaks = c("ORIEN", "TCGA"), values = c("red3", "cornflowerblue"), name = "", 
+                     na.value = "grey50") +
+  theme_bw() +
+  theme(text = element_text(size = 9))
+ggsave("../figures/volcano_buffa-deseq_orien-tcga_fc.png", height = 3, width = 6)
+```
+
+## Effect size
+
+```{r}
+dircheck <- volplot.in %>%
+  mutate(dir = ifelse(log2FoldChange < 0, "neg", "pos")) %>%
+  select(microbe, source, dir) %>%
+  spread(key = "source", value = "dir") %>%
+  filter(TCGA == ORIEN)
+consistenspecs <- dircheck$microbe
+```
+
+```{r}
+bigeffect.neg <- volplot.in %>%
+  filter(pvalue < 0.05 & microbe %in% consistenspecs) %>%
+  arrange(log2FoldChange)
+bigeffect.pos <- volplot.in %>%
+  filter(pvalue < 0.05 & microbe %in% consistenspecs) %>%
+  arrange(desc(log2FoldChange))
+
+bigeffect.spec <- unique(c(bigeffect.neg$microbe[1:5], bigeffect.pos$microbe[1:5]))
+
+effectplot.in <- volplot.in %>%
+  filter(microbe %in% bigeffect.spec) %>%
+  arrange(desc(log2FoldChange))
+
+effectplot.ord <- effectplot.in %>%
+  filter(source == "TCGA") %>%
+  arrange(log2FoldChange)
+effectplot.ord <- effectplot.ord$microbe
+```
+
+```{r}
+effectplot.in %>%
+  ggplot(aes(x =fct_relevel(microbe, effectplot.ord), y = log2FoldChange, fill = source)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(breaks = c("ORIEN", "TCGA"), values = c("red3", "cornflowerblue"), name = "") +
+  scale_x_discrete(breaks = effectplot.ord, labels = gsub("\\.", "\n", effectplot.ord)) +
+  coord_flip() +
+  labs(x = "") +
+  theme_bw() +
+  theme(text = element_text(size = 9))
+  
+ggsave("../figures/effectsize_buffa-deseq_orien-and-tcga_fc.png", height = 3, width = 5)
+```
+

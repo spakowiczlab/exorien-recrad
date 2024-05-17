@@ -1,0 +1,221 @@
+---
+title: "mouse experiments"
+author: "Rebecca Hoyd"
+date: "9/14/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(readxl)
+library(viridis)
+library(RColorBrewer)
+library(DESeq2)
+library(ggrepel)
+```
+
+# README
+
+This document is trying out a new format to simplify keeping lot of analyses in one exploratory document. All the formatting and analyses are being wrapped into functions so that it's easier to keep only the necessary data objects in the environment when tweaking plots. Later, these functions could be easily exported to a targets pipeline.
+
+# Load data
+
+```{r}
+mics <- read.csv("../data/mouse_RA-with-taxonomy.csv")
+# meta <- read_excel("../../data/Online_Service_Submission_Form_Sample_Info_and_Group_Comparison-zymo.xlsx", sheet = 2)
+hypox.labs <- readRDS("../data/mouse-tumor_hypox-scores.RDS")
+```
+
+# Format
+
+```{r match samples ALWAYS RUN}
+# colnames(meta) <- c("dont.use", "sample.name", "sample.type", "sample.in",
+#                     "sample.concentrate", "sample.volume", "sample.hazardous")
+# 
+# mics.numkey <- mics %>%
+#   dplyr::select(sample) %>%
+#   distinct() %>%
+#   filter(!grepl("Neg", sample)) %>%
+#   mutate(sample.number = gsub("DS.*_(.*)_R.*", "\\1", sample))
+# 
+# meta.form <- meta %>%
+#   separate(sample.name, into = c("sample.number", "mouse.line", "treatment"), remove = F) %>%
+#   right_join(mics.numkey) %>%
+#   dplyr::select(-dont.use)
+
+ meta.form <- hypox.labs %>%
+    filter(!is.na(buffa.high))
+```
+
+```{r utility functions}
+exoRAtowide <- function(data, taxlev){
+  tmp <- data
+  tmp$Taxa <- tmp[[taxlev]]
+  tmp.wide<- tmp %>%
+    dplyr::filter(!is.na(Taxa)) %>%
+    group_by(sample, Taxa) %>%
+    summarise(ra = sum(exo.ra, na.rm = T)) %>%
+    pivot_wider(names_from = "Taxa", values_from = "ra")
+  
+  tmp.wide[is.na(tmp.wide)] <- 0
+  return(tmp.wide)
+}
+
+exoToList <- function(taxalevels = c("domain", "kingdom", "phylum", "class", 
+                                    "order", "family", "genus", "species"), 
+                     data){
+  w.ls <- lapply(taxalevels, function(x) exoRAtowide(data, x))
+  names(w.ls) <- taxalevels
+  return(w.ls)
+}
+```
+
+```{r data for stacked bar}
+format_for_stacked <- function(){
+  mics.phyl <- mics %>%
+    filter(sample %in% hypox.labs$sample & microbe != "Mus.musculus") %>%
+    group_by(sample) %>%
+    mutate(tot.ra = sum(exo.ra),
+           ra = exo.ra/tot.ra) %>%
+    ungroup() %>%
+    group_by(sample, phylum) %>%
+    summarise(exo.ra = sum(ra)) %>%
+    ungroup()
+  
+  mics.phyl.ranks <- mics.phyl %>%
+    group_by(phylum) %>%
+    summarize(median.exo = median(exo.ra)) %>%
+    arrange(desc(median.exo)) %>%
+    mutate(ra.rank = row_number())
+  
+  phyl.named <- mics.phyl.ranks$phylum[1:8]
+  
+  stackedbar.dat <- mics.phyl %>%
+    mutate(phylum.lab = ifelse(phylum %in% phyl.named, phylum, "Other")) %>%
+    group_by(sample, phylum.lab) %>%
+    summarise(exo.ra = sum(exo.ra)) %>%
+    ungroup() %>%
+    left_join(hypox.labs) %>%
+    mutate(phylum.lab = fct_relevel(phylum.lab, phyl.named),
+           buffa.high = fct_relevel(
+             ifelse(buffa.high == 0, "Low Hypoxia", "High Hypoxia"),
+             "Low Hypoxia"))
+  
+  return(stackedbar.dat)
+}
+```
+
+```{r DESeq for volcano plots}
+
+# Quick check to determine what factor to multiply by to get integers
+# test <- mics %>%
+#     filter(sample %in% meta.form$sample & microbe != "Mus.musculus") %>%
+#     group_by(sample) %>%
+#     mutate(tot.ra = sum(exo.ra),
+#            ra = exo.ra/tot.ra) %>%
+#     ungroup()
+# min(test$ra[test$ra>0])
+
+DESeqAllTaxaBothMice <- function(){
+  
+  # Make everything counts in wrapper, no need to duplicate for each mouse
+  mics.integers <- mics %>%
+    filter(sample %in% meta.form$sample & microbe != "Mus.musculus") %>%
+    group_by(sample) %>%
+    mutate(tot.ra = sum(exo.ra),
+           exo.ra = exo.ra/tot.ra) %>%
+    ungroup()  %>%
+    mutate(exo.ra = floor(exo.ra * 1e7))
+  m.ls <- exoToList(data = mics.integers)
+  
+  all.des.res <- lapply(c("Nude", "Balbc"), function(x) runDESeq(x, m.ls)) %>%
+    bind_rows()
+  
+  return(all.des.res)
+  
+}
+
+runDESeq <- function(mline, mics.ls){
+  #Lines for getting DESeq inputs
+  meta.tmp <- meta.form %>%
+    filter(mouse.line == mline & sample %in% mics.ls[[1]]$sample)
+  mats.tmp <- lapply(mics.ls, function(x) x %>% 
+                       column_to_rownames(var = "sample") %>%
+                       t() %>%
+                       as.data.frame() %>%
+                       dplyr::select(meta.tmp$sample)
+  )
+  identical(colnames(mats.tmp[[1]]), meta.tmp$sample)
+  
+  # Lines for running DESeq
+  dds.tmp.ls <- lapply(mats.tmp, function(x) DESeqDataSetFromMatrix(countData = x, colData = meta.tmp, design = ~ buffa.high))
+  dds.tmp <- lapply(dds.tmp.ls, DESeq)
+  res <- lapply(names(dds.tmp), function(x) results(dds.tmp[[x]]) %>%
+                  as.data.frame() %>%
+                  rownames_to_column(var = "Taxa") %>% 
+                  mutate(TaxLev = x,
+                         mouse.line = mline)) %>%
+    bind_rows() %>%
+    mutate(padj = p.adjust(pvalue, method = "fdr"))
+  
+  return(res)
+}
+
+```
+
+# Plot
+
+```{r stacked bar facetted mouse treatment}
+stackedbar.dat <- format_for_stacked()
+phyl.breaks <- unique(stackedbar.dat$phylum.lab)
+ggplot(stackedbar.dat, aes(x = sample.number, y = exo.ra, fill = phylum.lab)) +
+  facet_wrap(vars(mouse.line, buffa.high), scales = "free_x") +
+  geom_col(position = "fill") +
+  labs(x = "Mouse", y = "Relative abundance") +
+  scale_fill_brewer(palette = "Set3", name = "Phylum",
+                    breaks = phyl.breaks,
+                    labels = gsub("p__", "", phyl.breaks)) +
+  theme_bw() +
+  theme(text = element_text(size = 8))
+ggsave("../figures/stacked-bar_mouse_phylum_hypox-lab.png", height = 4, width = 4)
+
+
+```
+
+```{r volcano all deseq results}
+# volcano.raw <- DESeqAllTaxaBothMice()
+labmics <- c("s__Bacteroides fragilis", "s__Drechmeria coniospora", "s__Pichia kudriavzevii")
+labmics.oth <- c("g__Cutibacterium", "g__Candida")
+# deseq.arranged <- volcano.raw %>%
+#   arrange(padj)
+# write.csv(deseq.arranged, "../data/deseq2_mouse_atov-dmso_RNASeq_hypox-lab.csv", row.names = F)
+volcano.raw <- read.csv("../data/deseq2_mouse_atov-dmso_RNASeq_hypox-lab.csv")
+
+volcano.raw %>%
+  mutate(colcode = ifelse(pvalue < 0.05, TaxLev, NA),
+         labtext = ifelse(!is.na(colcode) & Taxa %in% labmics, 
+                          gsub("\\w__", "", Taxa), 
+                          ifelse(Taxa %in% labmics.oth,
+                                 gsub("\\w__", "", Taxa),
+                                 NA)
+         ),
+         colcode = fct_relevel(colcode, 
+                               "domain", "kingdom", "phylum", "class", 
+                               "order", "family", "genus", "species")
+  ) %>%
+  ggplot(aes(x = log2FoldChange, y = -log(pvalue), label = labtext)) +
+  facet_wrap(vars(mouse.line), ncol = 1) +
+  geom_hline(yintercept = -log(0.05), lty = 2) +
+  geom_point(aes(color = colcode)) +
+  geom_text_repel(size = 2) +
+  scale_color_brewer(palette = "Dark2", na.value = "grey70", name = "Taxonomic\nLevel") +
+  theme_bw() +
+  theme(text = element_text(size = 8))
+ggsave("../figures/volcano_mouse_tumor_hypox-lab.png", width = 3.5, height = 3.5)
+```
+
+
+
+

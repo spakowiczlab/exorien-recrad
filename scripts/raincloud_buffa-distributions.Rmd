@@ -1,0 +1,88 @@
+---
+title: "buffa raincloud plot"
+author: "Rebecca Hoyd"
+date: "8/25/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(ggdist)
+library(ggrepel)
+```
+
+# Load data
+```{r load data}
+TME_calculated_signatures <- read_csv("../data/TME_calculated-signatures.csv")
+CancerCodes <- read_csv("../data/ORIEN_TCGA-codes.csv")
+
+tcga.sigs <- read.csv("../data/2022-03-16_TCGA_tmesig_v1.csv")
+tcga.codes <- read.csv("../data/2022-03-16/2022-03-16_TCGA_meta.csv")
+```
+
+# Format
+
+```{r}
+ORIEN_buffacancer <- TME_calculated_signatures%>%
+  select(sample, buffa.score) %>%
+  left_join(CancerCodes) %>%
+  mutate(source = "ORIEN")
+
+TCGA_buffacancer <- tcga.codes %>%
+  mutate(sample = file_id.expression) %>%
+  select(sample, TCGA.code) %>%
+  inner_join(tcga.sigs) %>%
+  mutate(source = "TCGA")
+
+buffacancer <- bind_rows(ORIEN_buffacancer, TCGA_buffacancer) %>%
+  mutate(fillcode = ifelse(TCGA.code %in% c("COAD", "READ"), source, NA),
+         facetcode = ifelse(!is.na(fillcode), 0, 1),
+         Cancer = ifelse(TCGA.code %in% c("COAD", "READ"), "COADREAD", TCGA.code)) %>%
+  filter(source!= "TCGA")
+
+coadread.med <- buffacancer %>%
+  filter(TCGA.code %in% c("COAD", "READ")) %>%
+  summarize(buffa.score = median(buffa.score)) %>%
+  mutate(Cancer = "COADREAD", 
+         facetcode = 0,
+         textval = paste0("Median = ", buffa.score))
+```
+
+```{r}
+buffacancer %>%
+  group_by(Cancer) %>%
+  summarise(buffa.med = median(buffa.score)) %>%
+  arrange(buffa.med)
+```
+
+# Plot
+
+```{r}
+buffacancer %>%
+  mutate(Cancer = fct_reorder(Cancer, buffa.score)) %>%
+  ungroup() %>%
+  ggplot(aes(x=buffa.score, y=Cancer))+
+  facet_grid(vars(facetcode), scales = "free") +
+  geom_point(aes(color = fillcode), size = 1,
+             show.legend = F, position = position_jitter(width = .15),
+             alpha = .5)+
+  ggdist::stat_halfeye(.width=c(0,1), aes(fill = fillcode), alpha = .5, show.legend = F,
+                       position = position_nudge(x = 0, y = .3))+
+  geom_point(data = coadread.med,
+             alpha = 1, size = 2, color = "black", 
+             position = position_nudge(x = 0, y = .3)) +
+  geom_text(data = coadread.med,
+                  position = position_nudge(x = 0, y = .5),
+                  aes(label = textval)) +
+  labs(x = "Buffa", y = "") +
+  scale_color_viridis_d(aesthetics = c("color", "fill"), na.value = "grey") +
+  theme_minimal() +
+  theme(text = element_text(size = 9),
+    strip.text = element_blank())
+
+ggsave("../figures/raincloud_coad-read.png", width = 3.5, height = 3.5)
+```
+
+

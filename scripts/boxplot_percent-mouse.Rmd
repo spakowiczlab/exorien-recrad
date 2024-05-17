@@ -1,0 +1,63 @@
+---
+title: "mouse experiments"
+author: "Rebecca Hoyd"
+date: "9/14/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(readxl)
+```
+
+
+
+# Load data
+
+```{r}
+mics <- read.csv("../data/mouse_RA-with-taxonomy.csv")
+hypox.labs <- readRDS("../data/mouse-tumor_hypox-scores.RDS")
+```
+
+# Boxplot
+
+```{r}
+percent.mouse <- mics %>%
+  mutate(chord = ifelse(grepl("Chord", phylum), "mouse", "microbe")) %>%
+  group_by(sample, chord) %>%
+  summarize(ra = sum(exo.ra)) %>%
+  filter(chord == "microbe") %>%
+  inner_join(hypox.labs)
+
+percent.mouse %>% 
+  ggplot(aes(x = as.factor(buffa.high), y = ra, fill = as.factor(buffa.high))) +
+  facet_wrap(vars(mouse.line)) +
+    geom_boxplot(show.legend = F) +
+  labs(x = "Hypoxia category", y = "Percent microbe") +
+  scale_x_discrete(breaks = c(0,1), labels = c("Low", "High")) +
+  scale_fill_brewer(palette = "Set1") +
+  theme_bw() +
+  theme(text = element_text(size = 8))
+ggsave("../figures/boxplot_microbe-abundance.png", width = 2, height = 2)
+```
+
+# Check significance
+
+```{r}
+nude.testdat <- percent.mouse %>%
+  filter(chord == "microbe" & mouse.line == "Nude")
+
+shapiro.test(nude.testdat$ra)
+t.test(ra ~ buffa.high, data = nude.testdat)
+```
+
+```{r}
+balb.testdat <- percent.mouse %>%
+  filter(chord == "microbe" & mouse.line == "Balbc")
+
+shapiro.test(balb.testdat$ra)
+t.test(ra ~ buffa.high, data = balb.testdat)
+```
+

@@ -1,0 +1,189 @@
+---
+title: "recrad effect size bar plot"
+author: "Caroline Wheeler"
+date: "10/21/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(ggplot2)
+library(reshape2)
+library(DESeq2)
+library(ggrepel)
+```
+
+# DESeq2 TCGA
+```{r}
+taxa <- read.table("../data/TCGA-READ_k2bout.txt", sep = '\t', header = TRUE)
+clin <- read.csv("../data/TCGA-cbioportal_buffa.csv")
+
+clin <- clin %>%
+  filter(buffa_hi_lo == "high" | buffa_hi_lo == "low") %>%
+  select(buffa_hi_lo, sample) %>%
+  mutate(buffa_hi_lo = fct_relevel(buffa_hi_lo, "low"))
+
+taxa <- merge(clin, taxa) %>%
+  select(-buffa_hi_lo)
+taxa <- column_to_rownames(taxa, 'sample')
+```
+
+filter out species that are present in less than 3 samples
+```{r}
+cond <- colSums(taxa != 0) > 2
+taxa <- taxa[, cond, drop = FALSE]
+
+#transpose
+species <- as.data.frame(t(taxa))
+
+species.sampord <- species %>%
+  dplyr::select(clin$sample)
+```
+
+# functions to create matrix and run through DESeq2
+```{r}
+run_deseq <- function(desd, meta){
+  dds <- DESeqDataSetFromMatrix(countData = desd,
+                                colData = meta,
+                                design = ~ buffa_hi_lo)
+  dds <- DESeq(dds)
+  res <- results(dds)
+  pd <- res$log2FoldChange
+  
+  resPlot <- data.frame(res) %>% mutate(threshold = padj < 0.05)
+  
+  return(resPlot)
+}
+```
+
+DESeq2 analysis
+```{r}
+species_rp <- run_deseq(species.sampord, clin)
+write.csv(species_rp, "../data/deseq2_tcga_fix-dir_vis.csv")
+```
+
+
+# DESeq2 ORIEN
+
+
+```{r}
+# labels made in exploratory/scripts/buffa_hypoxia_score.RMD
+ORIEN.labs <- read.csv("../../exploratory/data/ORIEN_GI_buffa-scores_high-low.csv", stringsAsFactors = F)
+ORIEN.mics <- read.table("../data/ORIEN-GI_k2bout.txt", header = T, sep = "\t")
+```
+
+```{r}
+ORIEN.coldat <- ORIEN.labs %>%
+  filter(buffa_hi_lo != "med") %>%
+  mutate(buffa_hi_lo = fct_relevel(buffa_hi_lo, "low"))
+ORIEN.countdat <- ORIEN.mics %>%
+  column_to_rownames(var = "sample") %>%
+  t() %>%
+  as.data.frame() %>%
+  dplyr::select(ORIEN.coldat$sample)
+
+ORIEN.dds <- DESeqDataSetFromMatrix(countData = ORIEN.countdat, colData = ORIEN.coldat, design = ~ buffa_hi_lo)
+ORIEN.dds <- DESeq(ORIEN.dds)
+
+ORIEN.res <- results(ORIEN.dds) %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "X") %>%
+  mutate(source = "ORIEN") %>%
+  dplyr::select(X, log2FoldChange, pvalue, padj, source) %>%
+  mutate(miclab = ifelse(pvalue < 0.05, source, NA))
+  
+write.csv(ORIEN.res, "../data/deseq2_exotic-GI.csv", row.names = F)
+```
+
+# Combine results - start here if not rerunning
+
+## Supp table of all deseq results
+
+```{r}
+tcga.res <- read.csv("../data/deseq2_tcga_fix-dir_vis.csv", stringsAsFactors = F)
+
+tcga.forjoin <- tcga.res %>%
+  mutate(source = "TCGA") %>%
+  dplyr::select(X, log2FoldChange, pvalue, padj, source) %>%
+  mutate(miclab = ifelse(pvalue < 0.05, source, NA))
+
+ORIEN.res <- read.csv("../data/deseq2_exotic-GI.csv")
+
+volplot.in <- bind_rows(tcga.forjoin, ORIEN.res)
+write.csv(volplot.in, "../tables/sup_DESeq2_buffa_TCGA-ORIEN_fixdir.csv", row.names = F)
+```
+
+## Check total numbers of sig in each group
+
+```{r}
+volplot.in <- read.csv("../tables/sup_DESeq2_buffa_TCGA-ORIEN_fixdir.csv")
+volplot.in %>%
+  filter(pvalue < 0.05) %>%
+  mutate(enriched.in = ifelse(log2FoldChange > 0, "lowBuffa", "highBuffa")) %>%
+  group_by(source, enriched.in) %>%
+  tally()
+```
+
+## Volcano plot
+
+```{r}
+volplot.in %>%
+  dplyr::filter(X != "Salmonella.enterica") %>%
+  mutate(textlab = ifelse(!is.na(miclab), X, NA)) %>%
+  ggplot(aes(x = log2FoldChange, y = -log(pvalue), color = miclab, label = textlab)) +
+  geom_point(show.legend = F) +
+  geom_text_repel(size = 2, show.legend = F) +
+  scale_color_manual(breaks = c("ORIEN", "TCGA"), values = c("red3", "cornflowerblue"), name = "", 
+                     na.value = "grey50") +
+  theme_bw() +
+  theme(text = element_text(size = 9))
+ggsave("../figures/volcano_buffa-deseq_orien-tcga_fixdir.png", height = 3, width = 3.5)
+```
+
+## Effect size
+
+```{r}
+dircheck <- volplot.in %>%
+  mutate(dir = ifelse(log2FoldChange < 0, "neg", "pos")) %>%
+  select(X, source, dir) %>%
+  spread(key = "source", value = "dir") %>%
+  filter(TCGA == ORIEN)
+consistenspecs <- dircheck$X
+```
+
+```{r}
+bigeffect.neg <- volplot.in %>%
+  filter(pvalue < 0.05 & X %in% consistenspecs) %>%
+  arrange(log2FoldChange)
+bigeffect.pos <- volplot.in %>%
+  filter(pvalue < 0.05 & X %in% consistenspecs) %>%
+  arrange(desc(log2FoldChange))
+
+bigeffect.spec <- unique(c(bigeffect.neg$X[1:5], bigeffect.pos$X[1:5]))
+
+effectplot.in <- volplot.in %>%
+  filter(X %in% bigeffect.spec) %>%
+  arrange(desc(log2FoldChange))
+
+effectplot.ord <- effectplot.in %>%
+  filter(source == "TCGA") %>%
+  arrange(log2FoldChange)
+effectplot.ord <- effectplot.ord$X
+```
+
+```{r}
+effectplot.in %>%
+  ggplot(aes(x =fct_relevel(X, effectplot.ord), y = log2FoldChange, fill = source)) +
+  geom_col(position = "dodge", show.legend = F) +
+  scale_fill_manual(breaks = c("ORIEN", "TCGA"), values = c("red3", "cornflowerblue"), name = "") +
+  scale_x_discrete(breaks = effectplot.ord, labels = gsub("\\.", "\n", effectplot.ord)) +
+  coord_flip() +
+  labs(x = "") +
+  theme_bw() +
+  theme(text = element_text(size = 9))
+  
+ggsave("../figures/effectsize_buffa-deseq_orien-and-tcga_fixdir.png", height = 3, width = 3)
+```
+

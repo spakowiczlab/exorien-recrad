@@ -1,0 +1,437 @@
+---
+title: "modeling with humann3"
+author: "Rebecca Hoyd"
+date: "9/23/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(purrr)
+library(readxl)
+library(DESeq2)
+library(rlist)
+
+library(httr)
+library(ggpattern)
+```
+
+# Load data
+
+```{r}
+# loadHumann <- function(){
+#   sample.dirs <- list.files("/fs/ess/PAS1695/projects/recrad/data/mouseexp/humann3/",
+#                             pattern = "002_\\d+", full.names = T)
+#   sample.files <- unlist(lapply(sample.dirs, function(x) list.files(x, pattern = "genefamilies", full.names = T)))
+#   
+#   samples.ls <- lapply(sample.files, function(x) read.delim(x))
+#   samples.df <- purrr::reduce(samples.ls, full_join)
+#   
+#   colnames(samples.df) <- gsub("_Abundance.*", "", colnames(samples.df))
+#   return(samples.df)
+# }
+
+# loadMeta <- function(){
+#   meta <- read_excel("../../data/Online_Service_Submission_Form_Sample_Info_and_Group_Comparison-zymo.xlsx", sheet = 2)
+#   colnames(meta) <- c("dont.use", "sample.name", "sample.type", "sample.in",
+#                       "sample.concentrate", "sample.volume", "sample.hazardous")
+#   
+#   mics.numkey <- as.data.frame(cbind(sample = colnames(humann3)[-1])) %>%
+#     filter(!grepl("Neg", sample)) %>%
+#     mutate(sample.number = gsub("DS.*_(.*)_R.*", "\\1", sample))
+#   
+#   meta.form <- meta %>%
+#     separate(sample.name, into = c("sample.number", "mouse.line", "treatment"), remove = F) %>%
+#     right_join(mics.numkey) %>%
+#     dplyr::select(-dont.use) %>%
+#     mutate(treatment = fct_relevel(treatment, "DMSO"))
+#   
+#   return(meta.form)
+# }
+
+
+# humann3 <- loadHumann()
+# write.csv(humann3, "../data/mouse_pathways.csv", row.names = F)
+
+humann3 <- read.csv("../data/mouse_pathways.csv", stringsAsFactors = F)
+meta <- readRDS("../data/mouse-tumor_hypox-scores.RDS")
+```
+
+# Format
+
+```{r}
+aggregate_to_genus <- function(){
+  tmp <- humann3 %>%
+    filter(grepl("\\|", X..Gene.Family) & !grepl("unclassified", X..Gene.Family)) %>%
+    pivot_longer(-X..Gene.Family, names_to = "sample", values_to = "RPK") %>%
+    separate(X..Gene.Family, sep = c("\\||\\."), into = c("gene", "taxa")) %>%
+    mutate(RPK = replace_na(RPK, 0)) %>%
+    group_by(sample, taxa, gene) %>%
+    summarise(RPK = round(sum(RPK))) %>%
+    ungroup()
+  return(tmp)
+}
+
+DESeqPerMouseLine <- function(m.line, wmat){
+  tmp.meta <- meta %>%
+    filter(mouse.line == m.line & sample %in% colnames(wmat) & !is.na(buffa.high))
+  tmp.mat <- wmat %>%
+    select(tmp.meta$sample)
+  
+  tmp.mat <- tmp.mat + 1
+  
+  dds<- DESeqDataSetFromMatrix(countData = tmp.mat, colData = tmp.meta,
+                                     design = ~buffa.high)
+  dds <- DESeq(dds)
+  res <- results(dds) %>%
+    as.data.frame() %>%
+    mutate(mouse.line = m.line) %>%
+    rownames_to_column(var = "gene")
+  
+  return(res)
+}
+
+DESeqPerGenus <- function(g, data){
+  tmp.wide <- data %>%
+    filter(taxa == g) %>%
+    select(-taxa) %>%
+    pivot_wider(names_from = "sample", values_from = "RPK") %>%
+    column_to_rownames(var = "gene")
+  
+
+  des.res <- lapply(c("Nude", "Balbc"), function(x) try(DESeqPerMouseLine(x,
+                                                                          tmp.wide))) %>%
+    list.clean(. ,is.character) %>%
+    bind_rows() %>%
+    mutate(genus = g)
+}
+
+DESeqAllGenera <- function(){
+  agg.gen <- aggregate_to_genus()
+  genera <- unique(agg.gen$taxa)
+
+  des.res <- lapply(genera, function(x) try(DESeqPerGenus(x, agg.gen))) %>%
+    bind_rows()
+  
+  return(des.res)
+  }
+```
+
+
+
+```{r}
+annotateUniprot <- function(accession){
+  url <- paste0("https://rest.uniprot.org/uniprotkb/", accession, ".json")
+  req.raw <- httr::GET(url)
+  req.res <- httr::content(req.raw)
+  
+  protname <- req.res$proteinDescription$recommendedName$fullName$value
+  subname <- req.res$proteinDescription$submissionNames[[1]]$fullName$value
+  
+  try({
+    cc.block <- req.res$comments
+    names(cc.block) <- lapply(cc.block, function(x) x$commentType)
+    protfun <- cc.block$FUNCTION$texts[[1]]$value
+    protpath <- cc.block$PATHWAY$texts[[1]]$value
+  })
+  protkeys <- paste(unlist(lapply(req.res$keywords, function(x) x$name)), collapse = ";")
+  
+  annot.row <- as.data.frame(
+    cbind(
+      gene = paste0("UniRef90_", accession),
+      protein.name = protname,
+      submitted.name = subname,
+      # pathway = ifelse(is.null(protpath), NA, protpath),
+      # protein.function = ifelse(is.null(protfun), NA, protfun),
+      keywords = protkeys
+  ))
+  
+  try({
+    annot.row$pathway <- protpath
+    annot.row$protein.function <- protfun
+  })
+  
+  return(annot.row)
+}
+
+annotateAllUniprot <- function(des.res){
+  prot.ids <- unique(gsub("UniRef90_", "", des.res$gene))
+  
+  annotate.ids <- lapply(prot.ids, function(x) annotateUniprot(x)) 
+  
+  annotated.df <- bind_rows(annotate.ids) %>%
+    select(gene,protein.name, submitted.name, pathway, protein.function, keywords)
+  
+  des.res.anno <- des.res %>%
+    left_join(annotated.df)
+  
+  return(des.res.anno)
+}
+```
+
+# plot
+
+```{r}
+# all.des.res <- DESeqAllGenera()
+# saveRDS(all.des.res, "../data/humann3_tumor-des_mic-expr_hypox-labs.RDS")
+all.des.res <- readRDS("../data/humann3_tumor-des_mic-expr_hypox-labs.RDS")
+
+all.des.res %>%
+  ggplot(aes(x = log2FoldChange, y = -log(pvalue))) +
+  facet_wrap(vars(genus, mouse.line)) +
+  geom_point() +
+  geom_hline(yintercept = -log(0.05), color = "red", lty = 2) +
+  theme_bw()
+ggsave("../figures/volcano_humann3_tumor-mic-expr_hypox-lab.png")
+
+all.des.res %>%
+  filter(genus == "g__Cutibacterium") %>%
+  ggplot(aes(x = log2FoldChange, y = -log(pvalue))) +
+  facet_wrap(vars(mouse.line)) +
+  geom_point() +
+  geom_hline(yintercept = -log(0.05), color = "red", lty = 2) +
+  theme_bw()
+ggsave("../figures/volcano_humann3_tumor-mic-expr_hypox-lab_cutibacterium.png")
+```
+
+```{r}
+all.des.res.anno <- annotateAllUniprot(all.des.res) %>%
+  arrange(padj)
+write.csv(all.des.res.anno, "../data/humann3_tumor-des_mic-expr_hypox-lab_anno.csv", row.names = F)
+```
+
+# Figures using ND annotations
+
+```{r}
+res.anno <- read.csv("../data/humann3_tumor-des_mic-expr_hypox-lab_anno.csv")
+
+res.anno.cuti <- res.anno %>%
+  filter(genus == "g__Cutibacterium")
+
+generate.comparisons <- res.anno.cuti %>%
+  mutate(sig = ifelse(pvalue < 0.05, "sig", "not"),
+         dir = ifelse(log2FoldChange >= 0, "pos", "neg"),
+         sigdir = paste(sig, dir)) %>%
+  select(gene,sigdir,mouse.line) %>%
+  pivot_wider(names_from = mouse.line, values_from = sigdir) %>%
+  separate(Balbc, into = c("Balbc.sig", "Balbc.dir")) %>%
+  separate(Nude, into = c("Nude.sig", "Nude.dir")) %>%
+  filter(Nude.sig == "sig" | Balbc.sig == "sig") %>%
+  mutate(SigCode = case_when(Nude.sig == Balbc.sig &
+                               Nude.dir == Balbc.dir ~ "Agree",
+                             Nude.sig == Balbc.sig & 
+                               Nude.dir != Balbc.dir ~ "Disagree",
+                             Nude.sig == "sig" & Balbc.sig != "sig" ~ "Nude sig",
+                             Balbc.sig == "sig" & Nude.sig != "sig" ~ "Balbc sig"),
+         DirAgree = Balbc.dir == Nude.dir)
+
+annotate.genes <- res.anno.cuti %>%
+  select(c("gene","protein.name", "submitted.name", "pathway", "protein.function","keywords")) %>%
+  distinct()
+
+annotate.comparisons <- generate.comparisons %>%
+  left_join(annotate.genes)
+
+write.csv(annotate.comparisons, "../data/DESeq2_cutibacterium_check-agree.csv",
+          row.names = F)
+```
+
+
+
+```{r}
+ND.tab <- read_excel("../../grants/R01/data/DESeq2_cutibacterium_check-agree.xlsx",
+                     sheet = 2)
+
+gene.anno <- ND.tab %>%
+  select(UniRef90, ND.anno)
+```
+
+## volcano
+
+```{r Old version highlighting mouse line agreement}
+
+# generate.comparisons %>%
+#   select(gene, SigCode) %>%
+#   mutate(SigCode = ifelse(SigCode %in% c("Agree", "Disagree"), SigCode, NA),
+#          alphcode = !is.na(SigCode)) %>%
+#   right_join(res.anno.cuti) %>%
+#   ggplot(aes(x = log2FoldChange, y =-log(pvalue),
+#              color = SigCode, alpha = alphcode, size = alphcode)) +
+#   facet_wrap(vars(mouse.line)) +
+#   geom_point(shape = 1) +
+#   scale_color_viridis_d(na.value = "grey50", name = "Agreement between \nmouse lines") +
+#   scale_alpha_manual(values = c(.2,1)) +
+#   scale_size_manual(values = c(2,3)) +
+#   guides(alpha = F,
+#          size = F) +
+#   geom_hline(yintercept = -log(0.05)) +
+#   theme_bw(base_size = 14)
+# ggsave("../figures/volcano_DESeq2_cutibacterium-agreement.png", 
+#        height = 3, width = 5)
+```
+
+```{r using grant annotations}
+plotdf <- 
+  res.anno %>%
+  filter(genus == "g__Cutibacterium") %>%
+  mutate(UniRef90 = gsub("UniRef90_", "", gene)) %>%
+  left_join(gene.anno) %>%
+  mutate(alph = if_else(is.na(ND.anno),
+                        true = 0.01,
+                        false = 1)) %>%
+  mutate(siz = if_else(is.na(ND.anno),
+                        true = 0.2,
+                        false = 2)) %>%
+  mutate(ND.other = if_else(is.na(ND.anno),
+                                   true = "Other",
+                                   gsub(" ", "\n",  str_to_sentence(ND.anno)))) %>%
+  mutate("Enzyme\nClass" = fct_relevel(ND.other, "Other", after = Inf))
+
+plotdf %>%
+  ggplot(aes(x = log2FoldChange, y =-log(pvalue), size = siz)) +
+  facet_wrap(vars(mouse.line), ncol = 1) +
+  geom_point(aes(color = `Enzyme\nClass`,
+                 alpha = alph),
+             shape = 21,
+             show.legend = F) +
+  geom_hline(yintercept = -log(0.05)) +
+  guides(alpha = F) +
+  theme_bw() +
+  # xlim(c(-7, 7)) +
+  # ylim(c(0, 6)) +
+  scale_size_area(max_size = 2, guide = "none") +
+  scale_color_manual(values = c("#440154", "#3b528b", "#5ec962", "grey50")) +
+  theme(text = element_text(size = 9))
+ggsave("../figures/volcano_DESeq2_cutibacterium-enzyme.png", 
+       height = 4, width = 3)
+
+plotdf %>%
+  ggplot(aes(x = log2FoldChange, y =-log(pvalue), size = siz)) +
+  facet_wrap(vars(mouse.line), ncol = 1) +
+  geom_point(aes(color = `Enzyme\nClass`,
+                 alpha = alph),
+             shape = 21) +
+  geom_hline(yintercept = -log(0.05)) +
+  guides(alpha = F) +
+  theme_bw() +
+  # xlim(c(-7, 7)) +
+  # ylim(c(0, 6)) +
+  scale_size_area(max_size = 2, guide = "none") +
+  scale_color_manual(values = c("#440154", "#3b528b", "#5ec962", "grey50")) +
+  theme(text = element_text(size = 9))
+ggsave("../figures/volcano_DESeq2_cutibacterium-enzyme_legend.png", 
+       height = 7, width = 3)
+```
+
+## Bar plot
+
+summarize differences by enzyme class
+
+```{r}
+plotdf.bar <- plotdf %>%
+  filter(ND.other != "Other") %>%
+  group_by(ND.other) %>%
+  mutate(l2fc.pos = log2FoldChange > 0,
+         l2fc.neg = log2FoldChange < 0
+  ) %>%
+  summarize("Hypoxia" = sum(l2fc.pos),
+            "Normoxia" = sum(l2fc.neg)) %>%
+  pivot_longer(cols = c("Hypoxia", "Normoxia"),
+               names_to = "Enriched in",
+               values_to = "Count")
+
+plotdf.bar %>%
+  ggplot(aes(x = Count, 
+             y = ND.other, 
+             fill = ND.other, 
+             pattern = `Enriched in`)) +
+  geom_bar_pattern(stat = "identity",
+                   position = position_dodge(),
+                   color = "black", 
+                   pattern_fill = "white",
+                   pattern_angle = 45,
+                   
+                   pattern_density = 0.1,
+                   pattern_spacing = 0.025,
+                   pattern_key_scale_factor = 0.6,
+                   show.legend = F) + 
+  labs(x = "Number of Significant Genes",
+       y = "") +
+  scale_fill_manual(values = c("#440154", "#3b528b", "#5ec962")) +
+  scale_pattern_manual(values = c("none", "stripe")) +
+  theme_bw(base_size = 9) +
+  guides(fill = FALSE)
+
+ggsave("../figures/bar_cutibacterium_enr-by-pathway.png", 
+       height = 3, width = 3)
+
+plotdf.bar %>%
+  ggplot(aes(x = Count, 
+             y = ND.other, 
+             fill = ND.other, 
+             pattern = `Enriched in`)) +
+  geom_bar_pattern(stat = "identity",
+                   position = position_dodge(),
+                   color = "black", 
+                   pattern_fill = "white",
+                   pattern_angle = 45,
+                   
+                   pattern_density = 0.1,
+                   pattern_spacing = 0.025,
+                   pattern_key_scale_factor = 0.6) + 
+  labs(x = "Number of Significant Genes",
+       y = "") +
+  scale_fill_manual(values = c("#440154", "#3b528b", "#5ec962")) +
+  scale_pattern_manual(values = c("none", "stripe")) +
+  theme_bw(base_size = 9) +
+  guides(fill = FALSE)
+
+ggsave("../figures/bar_cutibacterium_enr-by-pathway_legend.png", 
+       height = 3, width = 3)
+```
+
+## heatmap
+
+```{r}
+cuti.heatin <- res.anno.cuti %>%
+  mutate(UniRef90 = str_remove(gene, "UniRef90_")) %>%
+  select(UniRef90, log2FoldChange, pvalue, mouse.line) %>%
+  inner_join(ND.tab)
+
+
+cuti.heatin %>%
+  mutate(ylab = paste0(`protein name`,"\n(", UniRef90,")")) %>%
+  ggplot(aes(x = mouse.line, y = ylab, fill = log2FoldChange)) +
+  geom_tile(show.legend = F) +
+  # scale_y_discrete(limits = rev) +
+  scale_fill_distiller(palette = "BrBG", name = "Fold\nChange") +
+  labs(x = "", y = "") +
+  theme_classic() +
+  theme(text = element_text(size = 9),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "top")
+  # scale_alpha_manual(values = c(.2,.4,.6,.8,1))
+ggsave("../figures/heatmap_ND-agree-tab.png", width = 3.5, height = 7)
+
+cuti.heatin <- res.anno.cuti %>%
+  mutate(UniRef90 = str_remove(gene, "UniRef90_")) %>%
+  select(UniRef90, log2FoldChange, pvalue, mouse.line) %>%
+  inner_join(ND.tab)
+
+
+cuti.heatin %>%
+  mutate(ylab = paste0(`protein name`,"\n(", UniRef90,")")) %>%
+  ggplot(aes(x = mouse.line, y = ylab, fill = log2FoldChange)) +
+  geom_tile() +
+  # scale_y_discrete(limits = rev) +
+  scale_fill_distiller(palette = "BrBG", name = "Fold\nChange") +
+  labs(x = "", y = "") +
+  theme_classic() +
+  theme(text = element_text(size = 9),
+        legend.position = "top")
+  # scale_alpha_manual(values = c(.2,.4,.6,.8,1))
+ggsave("../figures/heatmap_ND-agree-tab_legend.png", width = 5, height = 7)
+```
+

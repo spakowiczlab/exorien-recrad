@@ -1,0 +1,79 @@
+---
+title: "recrad histogram"
+author: "Caroline Wheeler"
+date: "10/21/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE) 
+
+library(tidyverse)
+library(ggplot2)
+library(readxl)
+```
+
+# Load data
+```{r}
+TCGA.buffa <- read.csv("../data/2022-03-16_TCGA_tmesig_v1.csv") 
+
+ORIEN.buffa <- read.csv("../data/TME_calculated-signatures.csv", stringsAsFactors = F) %>%
+  mutate(source = "ORIEN") %>%
+  select(sample, source, buffa.score)
+
+TCGA.meta <- read.csv("../data/2022-03-16_TCGA_meta.csv") %>%
+  mutate(sample = file_id.expression) %>%
+  select(sample, TCGA.code)
+
+ORIEN.meta <- read.csv("../data/ORIEN_TCGA-codes.csv")
+```
+
+# Format and join
+
+```{r}
+TCGA.codes <- bind_rows(TCGA.meta, ORIEN.meta)
+
+buffa.join <- TCGA.buffa %>%
+  mutate(source = "TCGA") %>%
+  left_join(TCGA.codes) %>%
+  filter(TCGA.code %in% c("COAD", "READ"))
+ORIEN <- ORIEN.buffa %>%
+  left_join(TCGA.codes) %>%
+  filter(TCGA.code %in% c("COAD", "READ"))
+
+plot.in <- bind_rows(ORIEN, buffa.join) %>%
+  left_join(TCGA.codes) 
+```
+
+```{r}
+tertiles.ORIEN <- c(quantile(ORIEN$buffa.score, .3333), quantile(ORIEN$buffa.score, .6666))
+tertiles.TCGA <- c(quantile(buffa.join$buffa.score, .3333), quantile(buffa.join$buffa.score, .6666))
+```
+
+# Plot
+
+```{r}
+plot.in %>%
+  ggplot(aes(x = buffa.score, group = source, fill = source)) +
+  geom_density(alpha = .5, show.legend = F) +
+  scale_fill_manual(breaks = c("ORIEN", "TCGA"), 
+                    values = c("red3", "cornflowerblue"),
+                    name = "") +
+  labs(x = "Buffa Hypoxia Score", y = "Fraction of samples") +
+  geom_vline(xintercept = tertiles.ORIEN, lty = 2, color = "red4") +
+  geom_vline(xintercept = tertiles.TCGA, lty = 2, color = "darkblue") +
+  theme_bw() +
+  theme(text = element_text(size = 9))
+ggsave("../figures/density_buffa_orien-and-tcga.png", height = 3.5, width = 3)
+
+plot.in %>%
+  ggplot(aes(x = buffa.score, group = source, fill = source)) +
+  geom_density(alpha = .5) +
+  scale_fill_manual(breaks = c("ORIEN", "TCGA"), values = c("red3", "cornflowerblue"), name = "") +
+  labs(x = "Buffa Hypoxia Score", y = "") +
+  # geom_vline(xintercept = tertiles.ORIEN, lty = 2, color = "red4") +
+  # geom_vline(xintercept = tertiles.TCGA, lty = 2, color = "darkblue") +
+  theme_bw() +
+  theme(text = element_text(size = 9))
+ggsave("../figures/density_buffa_orien-and-tcga_legend.png", height = 3.5, width = 3)
+```

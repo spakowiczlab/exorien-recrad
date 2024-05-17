@@ -1,0 +1,311 @@
+---
+title: "P01_response-modeling"
+author: "Rebecca Hoyd"
+date: "7/28/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(readxl)
+library(survival)
+library(survminer)
+library(broom)
+```
+
+All data needed to run the survival analyses are saved in a deidentified RDS file.
+# Load data
+
+```{r}
+radiation <- read.csv("/fs/ess/PAS1695/projects/exorien/data/clinical/20PRJ060OSU_20210712_Radiation_V4.csv", stringsAsFactors = F)
+
+Linkage <- read_excel("/fs/ess/PAS1695/projects/exorien/data/clinical/20PRJ060OSU_20210707_ClinicalMolLinkage_V4_as-in-drake.xlsx") %>% rename("AvatarKey" = "ORIENAvatarKey")
+
+clin_diag <- read.csv("/fs/ess/PAS1695/projects/exorien/data/clinical/20PRJ060OSU_20210712_Diagnosis_V4.csv")
+clin_vit <- read.csv("/fs/ess/PAS1695/projects/exorien/data/clinical/20PRJ060OSU_20210712_VitalStatus_V4.csv")
+
+# Taken from exorien exploratory directory
+tme <- read.csv("../data/TME_calculated-signatures.csv", stringsAsFactors = F)
+
+mics <- read.csv("/fs/ess/PAS1695/projects/exorien/data/drake-output/2022-03-16/combined_prevalence.csv")
+
+# Was present in exorien/grants/data, I don't remember the rest of this file's history
+nmf <- read.csv("../data/NMF_group-members.csv") %>%
+  mutate(hypox = x,
+         sample = gsub("\\.genes.results", "", X)) %>%
+  select(hypox, sample)
+```
+
+# Functions
+
+```{r}
+exoRAtowideprev <- function(data, taxlev){
+  tmp <- data
+  tmp$Taxa <- tmp[[taxlev]]
+  tmp.wide<- tmp %>%
+    filter(!is.na(Taxa)) %>%
+    group_by(sample, Taxa) %>%
+    summarise(ra = sum(prev, na.rm = T)) %>%
+    mutate(ra = ifelse(ra > 0, 1, 0)) %>%
+    spread(key = "Taxa", value = "ra")
+
+  return(tmp.wide)
+}
+
+exoToDF <- function(taxalevels = c("domain", "kingdom", "phylum", "class", 
+                                    "order", "family", "genus", "species"), 
+                     data){
+  w.ls <- lapply(taxalevels, function(x) exoRAtowideprev(data, x))
+  w.df <- reduce(w.ls, function(x,y) left_join(x,y)) 
+  return(w.df)
+}
+```
+
+# Format
+
+```{r define radiation and limit to READ}
+# rad <- inner_join(Linkage,radiation, by = "AvatarKey")%>%
+#   rename("Dose" = "RadDose", "Cancer" = "TCGA.code",
+#          "flag" = "RadiationTherapyInd",
+#          "sample" = "RNASeq")%>%
+#   mutate(Rad_status = ifelse(grepl("No", flag), "No",
+#                       ifelse(grepl("Mig", flag)|grepl("Unk", Dose), "Unknown", "Yes")))%>%
+#   filter(Cancer == "READ") %>%
+#   filter(`Primary/Met` == "Primary") %>%
+#   select(AvatarKey, sample, Rad_status)
+
+rad <- inner_join(Linkage,radiation, by = "AvatarKey")%>%
+  rename("agec" = "Age At Specimen Collection","ager" = "AgeAtRadiationStart",
+         "PM" = "Primary/Met", "Dose" = "RadDose", "Cancer" = "TCGA.code",
+         "flag" = "RadiationTherapyInd", "sample" = "RNASeq")%>%
+  mutate(ager = ifelse(grepl("Age", ager), 90, 
+                       ifelse(grepl("Unknown",ager),0, ager)),
+         agec = ifelse(grepl("Age", agec), 90, agec),
+         agec = as.numeric(agec),
+         r2c = abs(as.numeric(ager)-as.numeric(agec)),
+         Rad_status = ifelse(grepl("No", flag), "No",
+                      ifelse(grepl("Mig", flag)|grepl("Unk", Dose), "Unknown", "Yes")),
+         Dose = ifelse(grepl("Unknown", Dose),0,
+                       ifelse(as.numeric(Dose) > 8887, NA, as.numeric(Dose))))%>%
+  select(AvatarKey, sample, agec, Cancer,PM, r2c, Rad_status, Dose,flag)%>%
+  group_by(AvatarKey)%>%
+  # filter(PM == "Primary")%>%
+  arrange(r2c)%>%
+  slice_head()%>%
+  ungroup()%>%
+  rename("Age" = "agec")
+```
+
+```{r format survival}
+surv <- Linkage %>%
+  select(AvatarKey, RNASeq, `Age At Specimen Collection`) %>%
+  left_join(clin_vit) %>%
+  mutate(AgeAtFirstContact = as.numeric(ifelse(grepl("o", `Age At Specimen Collection`),
+                                               NA, `Age At Specimen Collection`)),
+         AgeAtLastContact = as.numeric(ifelse(grepl("o", AgeAtLastContact), NA, AgeAtLastContact)),
+         YearsToLC = AgeAtLastContact - AgeAtFirstContact,
+         OS_days = YearsToLC*365.25,
+         vital.status = ifelse(VitalStatus == "Dead", 1, 0),
+         sample = RNASeq) %>%
+  select(AvatarKey,sample, OS_days, vital.status)
+
+# Checking if unknown OS will affect the modelling - no overlap, all good
+# test <- filter(surv, is.na(OS_days) & vital.status == 1)
+# test <- test %>% left_join(rad)
+```
+
+```{r get wide mics}
+mics.w <- exoToDF(data = mics)
+
+names(mics.w) <- make.names(names(mics.w))
+microbenames <- colnames(mics.w)[-1]
+
+mics.w[is.na(mics.w)] <- 0
+```
+
+```{r grab numbers for only the samples we want}
+centerkey <- Linkage %>%
+  mutate(sample = RNASeq) %>%
+  select(sample, `Site info`)
+
+modelin <- rad %>%
+  filter(Rad_status == "Yes" & Cancer %in% c("READ", "COAD")) %>%
+  select(AvatarKey, sample) %>%
+  left_join(tme) %>%
+  mutate(Buffa = ifelse(buffa.score > median(buffa.score), "High", "Low"),
+         Buffa = fct_relevel(Buffa, "Low")) %>%
+  select(AvatarKey, sample, Buffa) %>%
+  left_join(nmf) %>%
+  left_join(surv) %>%
+  left_join(mics.w) %>%
+  left_join(centerkey)
+
+saveRDS(modelin, "../data/modelData_ORIEN-survival.RDS")
+```
+
+```{r}
+modelin <- readRDS("../data/modelData_ORIEN-survival.RDS")
+modelin.years <- modelin %>%
+  mutate(OS_years = OS_days/365.25)
+```
+
+# Models
+
+## Univariate Buffa
+
+```{r only buffa}
+survres.buffa <- surv_fit(Surv(OS_years, vital.status) ~ Hypoxia, data = mutate(modelin.years, Hypoxia = Buffa))
+
+survplot.buffa <- ggsurvplot(survres.buffa, pval = T, risk.table = F, palette = c("red", "black"), legend = "right") +
+  labs(x = "Years")
+```
+
+```{r}
+ggsave(survplot.buffa$plot,filename =  "../figures/survival_buffa.png",
+       height = 3, width = 4.5)
+
+
+write.csv(survplot.buffa$data.survtable, "../tables/sup_1c_suvtab.csv", row.names = F)
+
+```
+
+```{r only nmf sig}
+# survres.hypox <- surv_fit(Surv(OS_days, vital.status) ~ hypox, data = modelin)
+# 
+# survplot.hypox <- ggsurvplot(survres.hypox, pval = T, risk.table = T, palette = c("red", "black"))
+```
+
+```{r}
+# pdf("../figures/survival_nmf.pdf")
+# survplot.hypox
+# dev.off()
+```
+
+## Search for sig interactions
+
+
+```{r}
+ModelSurvInt <- function(mname){
+  form <- as.formula(paste0("Surv(OS_days, vital.status) ~ Buffa*", mname))
+  tmp <- coxph(form, data = modelin) %>%
+    tidy() %>%
+    filter(grepl(":", term))
+  return(tmp)
+}
+```
+
+```{r}
+survres.interactions <- lapply(microbenames, ModelSurvInt)
+
+survres.inter.df <- bind_rows(survres.interactions) %>%
+  mutate(padj = p.adjust(p.value)) %>%
+  arrange(p.value)
+
+write.csv( survres.inter.df, "../data/survival_buffa-microbe-interactions.csv", row.names = F)
+```
+
+# Visuals
+
+## Interaction KM
+```{r, eval = F}
+survres.buffaint <- surv_fit(Surv(OS_days, vital.status) ~ Buffa + s__Fusobacterium.canifelinum, data = modelin)
+
+saveRDS(survres.buffaint, "../data/surv-model_Buffa-Fuso-int.RDS")
+```
+
+```{r, eval = F}
+survres.buffaint <- readRDS("../data/surv-model_Buffa-Fuso-int.RDS")
+
+survplot.buffaint <- ggsurvplot(survres.buffaint, pval = T, risk.table = F,
+                                # palette = c("red", "darkred", "blue", "darkblue"), 
+                                palette = c("#fde725", "#35b779", "#31688e", "#440154"),
+                                legend = "none"
+                                )
+
+survplot.buffaint
+# ggsave("../figures/survival_buffa-fuso_viridis.png",
+#       height = 3, width = 4)
+```
+
+```{r, eval = F}
+# pdf("../figures/P01_survival_buffa-fuso.pdf")
+# survplot.buffaint
+# dev.off()
+```
+
+## Univariate fuso
+
+```{r}
+survres.fuso <- surv_fit(Surv(OS_years, vital.status) ~ F.canifelinum,
+                         data = mutate(modelin.years,
+                                       F.canifelinum = s__Fusobacterium.canifelinum))
+
+survplot.fuso <- ggsurvplot(survres.fuso, pval = T, risk.table = F, palette = c("black", "red"), legend = "right", legend.title = "F. canifelinum",legend.labs = c("Absent", "Present")) +
+  labs(x = "Years")
+
+ggsave(survplot.fuso$plot,filename =  "../figures/survival_fuso.png", height = 3, width = 4.5)
+
+write.csv(survplot.fuso$data.survtable, "../tables/sup_survtab_3B.csv", row.names = F)
+```
+
+
+
+## Interaction Effect size
+
+```{r}
+inter.table <- survres.inter.df %>%
+  filter(p.value < 0.05 & grepl("s__", term)) %>%
+  mutate(HazardRatio = exp(estimate),
+         ConfInt.Low = exp(estimate - std.error),
+         ConfInt.High = exp(estimate + std.error),
+         p.value = ifelse(p.value < 0.001, "***",
+                          ifelse(p.value < 0.01, "**", "*")),
+         species = gsub("BuffaLow:s__", "",
+                        gsub("\\.", " ", term))) %>%
+  select(species, HazardRatio, p.value)
+
+inter.table
+write.csv(inter.table, "../tables/fig3_survival-interactions.csv", row.names = F)
+```
+
+# Additional checks
+
+```{r cancer center breakdown}
+modelin %>%
+  group_by(`Site info`) %>%
+  tally()
+```
+
+```{r prevalences of significant species}
+prev.long <- modelin %>%
+  select(c("sample", "Buffa", gsub("BuffaHigh:", "",
+                                   gsub(" ", "\\.", inter.table$species)))) %>% 
+  pivot_longer(-c("sample", "Buffa"), names_to = "species", values_to = "prevalence")
+
+# Figure out percent samples that had at least one sig species
+buffa.counts <- prev.long %>%
+  group_by(sample, Buffa) %>%
+  summarize(any.prev = ifelse(sum(prevalence) > 0, 1, 0)) %>%
+  ungroup() %>%
+  group_by(Buffa) %>%
+  add_count() %>%
+  summarise(species.prev = sum(any.prev),
+            buffa.prev = mean(n)) 
+
+species.grouped.prev <- prev.long %>%
+  group_by(species, Buffa) %>%
+  summarise(prevalence = sum(prevalence)) %>%
+  left_join(buffa.counts) %>%
+  mutate(prevalence = prevalence/buffa.prev) %>%
+  select(-buffa.prev, -species.prev) %>%
+  pivot_wider(names_from = Buffa, values_from = prevalence) %>%
+  rename("Buffa.Low" = "Low",
+         "Buffa.High" = "High")
+
+# write.csv(buffa.counts, "../data/P01_prevalence_buffa-split.csv",
+#           row.names = F)
+# write.csv(species.grouped.prev, "../data/P01_prevalence_species-fraction-buffa.csv",
+#           row.names = F)
+```

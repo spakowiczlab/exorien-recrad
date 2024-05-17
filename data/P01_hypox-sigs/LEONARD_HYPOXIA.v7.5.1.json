@@ -1,0 +1,3 @@
+{
+  "LEONARD_HYPOXIA" : {"systematicName":"M19622","pmid":"12885785","exactSource":"Table 1","geneSymbols":["ADORA2B","AK4","ALDOA","BHLHE40","BNIP3","CCNG2","CDKN1B","CDKN1C","DDIT4","DEPP1","DUSP1","EFNA1","F3","FOSL2","HNRNPA1","HOXA4","HOXA5","JMJD6","JUNB","KDM3A","MUC1","NFIL3","P4HA1","P4HA2","PDGFB","PFKFB4","PFKP","PGK1","PHC2","PLIN2","PPP1R3C","RASGRP1","SAP30","SERPINE1","SLC16A3","SLC2A1","SLC2A3","SLC7A5","STC2","TGFA","VEGFA"],"msigdbURL":"https://www.gsea-msigdb.org/gsea/msigdb/cards/LEONARD_HYPOXIA","externalDetailsURL":[],"filteredBySimilarity":[],"externalNamesForSimilarTerms":[]}
+}

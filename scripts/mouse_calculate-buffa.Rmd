@@ -1,0 +1,190 @@
+---
+title: "Mouse tumor buffa"
+author: "Rebecca Hoyd"
+date: "11/16/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(tmesig)
+library(readxl)
+
+```
+
+# Determine buffa genes
+
+```{r}
+Hs.genes <- inputGenes("Buffa")
+
+# Biomart is not cooperation, this process gets decent matching
+mouse_human_genes = read.csv("http://www.informatics.jax.org/downloads/reports/HOM_MouseHumanSequence.rpt",sep="\t")
+
+convert_mouse_to_human <- function(gene_list){
+
+  output = c()
+
+  for(gene in gene_list){
+    class_key = (mouse_human_genes %>% filter(Symbol == gene & Common.Organism.Name=="human"))[['DB.Class.Key']]
+    if(!identical(class_key, integer(0)) ){
+      human_genes = (mouse_human_genes %>% filter(DB.Class.Key == class_key & Common.Organism.Name=="mouse, laboratory"))[,"Symbol"]
+      for(human_gene in human_genes){
+        output = append(output,human_gene)
+      }
+    }
+  }
+
+  return (output)
+}
+Mm.genes <- convert_mouse_to_human(Hs.genes)
+```
+```{r mito genes}
+Hs.mito <- inputGenes("Mitoscore")
+
+# Biomart is not cooperation, this process gets decent matching
+mouse_human_genes = read.csv("http://www.informatics.jax.org/downloads/reports/HOM_MouseHumanSequence.rpt",sep="\t")
+
+convert_mouse_to_human <- function(gene_list){
+
+  output = c()
+
+  for(gene in gene_list){
+    class_key = (mouse_human_genes %>% filter(Symbol == gene & Common.Organism.Name=="human"))[['DB.Class.Key']]
+    if(!identical(class_key, integer(0)) ){
+      human_genes = (mouse_human_genes %>% filter(DB.Class.Key == class_key & Common.Organism.Name=="mouse, laboratory"))[,"Symbol"]
+      for(human_gene in human_genes){
+        output = append(output,human_gene)
+      }
+    }
+  }
+
+  return (output)
+}
+Mm.mito <- convert_mouse_to_human(Hs.mito)
+```
+
+# Calculate tumor buffa scores
+
+```{r}
+loadMeta <- function(){
+  meta <- read_excel("../data/Online_Service_Submission_Form_Sample_Info_and_Group_Comparison-zymo.xlsx", sheet = 2)
+  colnames(meta) <- c("dont.use", "sample.name", "sample.type", "sample.in",
+  
+                                          "sample.concentrate", "sample.volume", "sample.hazardous")
+  mics.numkey <- as.data.frame(cbind(sample = colnames(exprs)[-1])) %>%
+    filter(!grepl("Neg", sample)) %>%
+    mutate(sample.number = gsub("DS.*_(.*)_R.*", "\\1", sample))
+  
+  meta.form <- meta %>%
+    separate(sample.name, into = c("sample.number", "mouse.line", "treatment"), remove = F) %>%
+    right_join(mics.numkey) %>%
+    dplyr::select(-dont.use)
+  
+  return(meta.form)
+}
+```
+
+```{r}
+exprs <- read.csv("../data/mouse_expressions.csv") %>%
+  rename("Gene" = "Geneid")
+
+exprs.tum <- exprs %>%
+  dplyr::select(-contains("002_S"))
+
+buffa <- calculateBuffa(exprs.tum, Mm.genes)
+
+meta <- loadMeta()
+```
+
+# Visualize groups
+
+```{r}
+buffa_labelled <- meta %>%
+  filter(!grepl("S", sample.number)) %>%
+  left_join(buffa)
+
+buffa_labelled %>%
+  ggplot(aes(x = mouse.line, y = buffa.score, fill = treatment)) +
+  geom_boxplot()
+
+ggsave("../figures/boxplot_atov-dmso_hypox.png")
+```
+
+```{r}
+buffa_nude <- buffa_labelled %>%
+  filter(mouse.line == "Nude")
+kruskal.test(buffa.score ~ treatment, data = buffa_nude)
+
+buffa_balb <- buffa_labelled %>%
+  filter(mouse.line == "Balbc")
+kruskal.test(buffa.score ~ treatment, data = buffa_balb)
+```
+
+# Try Mitoscore
+
+```{r}
+mito <- calculateMitoscore(exprs.tum, Mm.mito)
+
+mito_labelled <- meta %>%
+  filter(!grepl("S", sample.number)) %>%
+  left_join(mito)
+
+mito_labelled %>%
+  ggplot(aes(x = mouse.line, y = MitoScore, fill = treatment)) +
+  geom_boxplot()
+
+ggsave("../figures/boxplot_atov-dmso_mitoscore.png")
+```
+
+```{r}
+mito_nude <- mito_labelled %>%
+  filter(mouse.line == "Nude")
+kruskal.test(MitoScore ~ treatment, data = mito_nude)
+```
+
+# Generate new labels
+
+```{r}
+buffa.newlabs <- buffa_labelled %>%
+  mutate(buffa.high = ifelse(buffa.score > quantile(buffa.score, .5),
+                             1, 0)) %>%
+  select(sample.name, sample.number, mouse.line, treatment, sample, buffa.score, buffa.high)
+
+mito.newlabs <- mito_labelled %>%
+  mutate(mito.high = case_when(MitoScore < quantile(MitoScore, .3333) ~ 0,
+                               MitoScore > quantile(MitoScore, .6666) ~ 1)) %>%
+  select(sample.name, sample.number, mouse.line, treatment, sample, MitoScore, mito.high)
+
+meta.newlabs <- buffa.newlabs %>%
+  left_join(mito.newlabs)
+saveRDS(meta.newlabs, "../data/mouse-tumor_hypox-scores.RDS")
+```
+
+```{r}
+meta.newlabs <- readRDS("../data/mouse-tumor_hypox-scores.RDS")
+meta.newlabs %>% 
+  mutate(Hypoxia = if_else(buffa.high == 1, 
+                           true = "High",
+                           false = "Low")) %>%
+  mutate(Hypoxia = fct_relevel(Hypoxia, "Low")) %>%
+  ggplot(aes(x = Hypoxia, y = buffa.score, fill = Hypoxia)) +
+  facet_wrap(~mouse.line) +
+  geom_boxplot(show.legend = F) +
+  labs(x = "Hypoxia category", y = "Buffa Hypoxia Score") +
+  scale_fill_brewer(palette = "Set1") +
+  theme_bw() +
+  theme(text = element_text(size = 8))
+ggsave("../figures/boxplot_mouse-tumor_buffa-groups.png", height = 2, width = 2)
+
+# meta.newlabs %>% 
+#   ggplot(aes(x = as.character(buffa.high), 
+#              y = buffa.score,
+#              fill = treatment)) +
+#   geom_boxplot() +
+#   labs(x = "Buffa group", y = "Buffa Hypoxia Score")
+# ggsave("../figures/boxplot_mouse-tumor_buffa-groups_treatment.png",
+#        height = 3, width = 4)
+
+```

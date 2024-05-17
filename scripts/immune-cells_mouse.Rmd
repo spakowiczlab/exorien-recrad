@@ -1,0 +1,168 @@
+---
+title: "Immune cell infiltrate"
+author: "Rebecca Hoyd"
+date: "11/1/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(vegan)
+library(readxl)
+```
+
+# Load data
+
+```{r}
+tme <- readRDS("../data/mouse-tumor_hypox-scores.RDS")
+
+imcell <- read.csv("../data/CIBERSORTx_mouse-immune_human-ort.csv")
+```
+
+# Format
+
+
+
+```{r, eval=FALSE}
+lapply(imcell[, 2:25], shapiro.test)
+```
+
+```{r}
+modin <- imcell %>%
+  select(-RMSE,-P.value,-Correlation) %>%
+  mutate(TILs = rowSums(across(where(is.numeric))),
+         sample = Mixture) %>%
+  inner_join(tme) %>%
+  mutate(buffa.bin = ifelse(buffa.high == 0, "Low", "High"))
+
+imcells <- colnames(modin)[2:24]
+
+```
+
+# Tests
+
+Monocytes are closest to significant
+```{r}
+res.kw <- lapply(imcells, function(x) try(kruskal.test(formula = as.formula(paste0(x," ~ as.factor(buffa.bin)")),
+                                                   data = modin)))
+
+```
+
+```{r}
+names(res.kw) <- imcells
+res.df <- lapply(imcells, function(x) broom::tidy(res.kw[[x]]) %>%
+         mutate(ImmuneCell = x)) %>%
+  bind_rows() %>%
+  mutate(padj = p.adjust(p.value, method = "fdr")) %>%
+  arrange(padj)
+
+head(res.df)
+
+write.csv(res.df, "../tables/sup_kruskal_mouse-immune_full-cohort.csv", row.names = F)
+```
+
+# Visualizations
+
+
+```{r}
+quickbox <- function(celltype){
+  modin %>%
+    rename("choosecell" := !!celltype) %>%
+    ggplot(aes(x = as.character(buffa.high), y = choosecell)) +
+    geom_boxplot() +
+    labs(y = celltype) +
+    theme_bw()
+  ggsave(filename = paste0("../figures/boxplots_mouse/boxplot_", celltype, ".png"))
+}
+
+lapply(imcells, quickbox)
+```
+
+## Heatmap cells
+
+```{r}
+imcells.forclust <- modin %>%
+  select(c("sample", imcells)) %>%
+  column_to_rownames(var = "sample")
+
+sampord <- imcells.forclust %>%
+  dist() %>%
+  hclust()
+sampord.v <- sampord$labels[sampord$order]
+
+cellord <- imcells.forclust %>%
+  t() %>%
+  dist() %>%
+  hclust()
+cellord.v <- cellord$labels[cellord$order]
+```
+
+```{r}
+plot(sampord)
+
+```
+
+```{r}
+modin %>%
+  pivot_longer(imcells, names_to = "ImmunCell", values_to = "fraction") %>%
+  filter(ImmunCell != "TILs") %>%
+  ggplot(aes(x = fct_relevel(ImmunCell, cellord.v), y = fct_relevel(sample, sampord.v), fill = fraction)) +
+  geom_tile() +
+  labs(x = "", y = "") +
+  scale_fill_viridis_c() +
+  scale_y_discrete(breaks = modin$sample, labels = modin$buffa.high) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+ggsave("../figures/heatmap_immune-cells_mouse.png")
+```
+
+# Account for Nude v Balbc
+
+```{r}
+modin.nude <- modin %>%
+  filter(mouse.line == "Nude")
+modin.balb <- modin %>%
+  filter(mouse.line == "Balbc")
+
+res.nude <- lapply(imcells, function(x) try(kruskal.test(formula = as.formula(paste0(x," ~ as.factor(buffa.bin)")),
+                                                   data = modin.nude) %>%
+                                            broom::tidy() %>%
+                                            mutate(ImmuneCell = x))) %>%
+  bind_rows() %>%
+  mutate(mouse = "Nude")
+
+res.balb <- lapply(imcells, function(x) try(kruskal.test(formula = as.formula(paste0(x," ~ as.factor(buffa.bin)")),
+                                                   data = modin.balb) %>%
+                                            broom::tidy() %>%
+                                            mutate(ImmuneCell = x))) %>%
+  bind_rows() %>%
+  mutate(mouse = "Balbc")
+
+write.csv(bind_rows(res.nude, res.balb), "../tables/sup_kruskal_mouse-immune_split-mouseline.csv", row.names = F)
+```
+
+# Boxplots significant cells
+
+```{r}
+sig.cells <- res.df %>%
+  filter(p.value < 0.05)
+
+plotdat.facet <- modin %>%
+  select(sample, sig.cells$ImmuneCell, buffa.bin) %>%
+  pivot_longer(sig.cells$ImmuneCell, names_to = "imcell", values_to = "ra")
+
+plotdat.facet %>%
+  # filter(imcell != "T.cells.regulatory..Tregs.") %>%
+  ggplot(aes(x = buffa.bin, y = ra)) +
+  facet_wrap(vars(imcell),ncol = 2, scales = "free_y") +
+  geom_boxplot() +
+  # scale_fill_brewer(palette = "Set1", name = "Hypoxia") +
+  labs(x = "",  y = "Cell abundance") +
+  theme_bw() +
+  theme(text = element_text(size = 9),
+        axis.text.x = element_text(angle = 10, hjust = 1),
+        legend.position = "top")
+ggsave("../figures/boxplot_hypoxia-immune_mouse.png")
+```

@@ -1,0 +1,184 @@
+---
+title: "Untitled"
+author: "Rebecca Hoyd"
+date: "8/18/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(tmesig)
+library(jsonlite)
+library(readxl)
+```
+
+All data required to run the mtsurv analyses are saved in a csv file.
+
+# Define additional genes
+
+```{r load signatures}
+sig.files <- list.files("../data/P01_hypox-sigs/", full.names = T)
+
+readSigs <- function(x){
+  test <- readLines(x)
+  test2 <- fromJSON(test)
+  test3 <- test2[[1]]$geneSymbols
+  
+  return(test3)
+}
+
+siglist <- lapply(sig.files, function(y) try(readSigs(y)))
+names(siglist) <- gsub(".*sigs//(.*)_.*", "\\1", sig.files)
+```
+
+# Run Z scores
+
+```{r load expression data}
+exprs <- read.csv("/fs/ess/PAS1695/projects/exorien/data/aggregated-expressions.csv",
+                  stringsAsFactors = F)
+colnames(exprs) <- gsub(".genes.results", "", colnames(exprs))
+```
+
+```{r functions for z score}
+calc_labelled_z <- function(sig){
+  tmp <- calculateAvgZScore(exprs, siglist[[sig]]) %>%
+    rename(!! sig := "avg_z_score")
+}
+
+calculate_many_zscores <- function(){
+  avail.sigs <- names(siglist)
+  
+  sigs.ls <- lapply(avail.sigs, calc_labelled_z)
+  sigs.df <- reduce(sigs.ls, left_join)
+}
+```
+
+```{r}
+hypox.sigs <- calculate_many_zscores()
+```
+
+# Check survival analyses
+
+## Format dataset
+
+```{r load remaining data}
+radiation <- read.csv("/fs/ess/PAS1695/projects/exorien/data/clinical/20PRJ060OSU_20210712_Radiation_V4.csv", stringsAsFactors = F)
+
+Linkage <- read_excel("/fs/ess/PAS1695/projects/exorien/data/clinical/20PRJ060OSU_20210707_ClinicalMolLinkage_V4_as-in-drake.xlsx") %>% rename("AvatarKey" = "ORIENAvatarKey")
+
+clin_vit <- read.csv("/fs/ess/PAS1695/projects/exorien/data/clinical/20PRJ060OSU_20210712_VitalStatus_V4.csv")
+tme <- read.csv("..//data/TME_calculated-signatures.csv", stringsAsFactors = F)
+
+```
+
+```{r clinical formatting}
+# Get the radiation portion of clinical data
+rad <- inner_join(Linkage,radiation, by = "AvatarKey")%>%
+  rename("agec" = "Age At Specimen Collection","ager" = "AgeAtRadiationStart",
+         "PM" = "Primary/Met", "Dose" = "RadDose", "Cancer" = "TCGA.code",
+         "flag" = "RadiationTherapyInd", "sample" = "RNASeq")%>%
+  mutate(ager = ifelse(grepl("Age", ager), 90, 
+                       ifelse(grepl("Unknown",ager),0, ager)),
+         agec = ifelse(grepl("Age", agec), 90, agec),
+         agec = as.numeric(agec),
+         r2c = abs(as.numeric(ager)-as.numeric(agec)),
+         Rad_status = ifelse(grepl("No", flag), "No",
+                      ifelse(grepl("Mig", flag)|grepl("Unk", Dose), "Unknown", "Yes")),
+         Dose = ifelse(grepl("Unknown", Dose),0,
+                       ifelse(as.numeric(Dose) > 8887, NA, as.numeric(Dose))))%>%
+  select(AvatarKey, sample, agec, Cancer,PM, r2c, Rad_status, Dose,flag)%>%
+  group_by(AvatarKey)%>%
+  # filter(PM == "Primary")%>%
+  arrange(r2c)%>%
+  slice_head()%>%
+  ungroup()%>%
+  rename("Age" = "agec")
+
+# Get the survival portion of clinical data
+surv <- Linkage %>%
+  select(AvatarKey, RNASeq, `Age At Specimen Collection`) %>%
+  left_join(clin_vit) %>%
+  mutate(AgeAtFirstContact = as.numeric(ifelse(grepl("o", `Age At Specimen Collection`),
+                                               NA, `Age At Specimen Collection`)),
+         AgeAtLastContact = as.numeric(ifelse(grepl("o", AgeAtLastContact), NA, AgeAtLastContact)),
+         YearsToLC = AgeAtLastContact - AgeAtFirstContact,
+         days = YearsToLC*365.25,
+         vitalstatus = ifelse(VitalStatus == "Dead", 1, 0),
+         sample = RNASeq) %>%
+  select(AvatarKey,sample, days, vitalstatus)
+
+# Combine clinical
+clindat <- rad %>%
+  filter(Rad_status == "Yes" & Cancer %in% c("READ", "COAD")) %>%
+  left_join(surv)
+```
+
+```{r signature formatting}
+allHypox <- tme %>%
+  select(sample, buffa.score) %>%
+  left_join(hypox.sigs)
+
+modelin <- clindat %>%
+  left_join(allHypox)
+write.csv(modelin, "../data/modelData_mtsurv-inputs.csv", row.names = F)
+```
+
+## Mt.Surv runs
+
+```{r}
+library(mt.surv)
+```
+
+```{r}
+hypoxnames <- c(names(siglist), "buffa.score")
+
+survquant.res <- lapply(hypoxnames, function(x) survivalByQuantile(x,
+                                                                   modelin, modelin, 
+                                                                   percentiles = seq(0.02, 0.98,
+                                                                                     0.02)) %>%
+                          mutate(sig = x))
+
+survquant.df <- bind_rows(survquant.res)
+```
+
+```{r area vis}
+surv.area <- survquant.df %>%
+  filter(sig %in% c("buffa.score", "WINTER_HYPOXIA", "LEONARD")) %>%
+  filter(pval < 0.05) %>%
+  mutate(sig.dif = 0.05 - pval,
+         surv.effect = ifelse(hazard.direction == "<1", "positive","negative")) %>%
+  group_by(sig, surv.effect) %>%
+  summarise(sig.area = sum(sig.dif))
+
+surv.area %>%
+  ggplot(aes(x = sig, y = sig.area, fill = sig)) +
+  geom_col(show.legend = F) +
+  scale_fill_viridis_d() +
+  labs(x = "", y = "Significant area")+
+  coord_flip() +
+  theme_bw() +
+  theme(text = element_text(size = 8),
+    axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+ggsave("../figures/barplot_mtsurv-areas.png", width = 1.2,height = 1.2)
+```
+
+```{r survbyquant vis}
+survquant.df %>%
+  filter(sig %in% c("buffa.score", "WINTER_HYPOXIA", "LEONARD")) %>%
+ggplot(aes(x = percentile, y = -log(pval), group = sig, color = sig)) +
+  geom_line(size = 1.5) +
+  geom_hline(yintercept = -log(0.05), lty = 2) +
+  scale_color_viridis_d(name = "Hypoxia score",
+                        breaks = c("buffa.score", "LEONARD", "WINTER_HYPOXIA"),
+                        labels = c("Buffa", "Leonard", "Winter")) +
+  labs(x = "Percentile") +
+  theme_bw() +
+  theme(text = element_text(size = 8))
+ggsave("../figures/mtsurv_hypox-sigs.png", height = 3, width = 3.5)
+```
+
+
+

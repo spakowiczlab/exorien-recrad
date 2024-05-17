@@ -1,0 +1,143 @@
+---
+title: "mouse experiments"
+author: "Rebecca Hoyd"
+date: "9/14/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(readxl)
+library(viridis)
+library(RColorBrewer)
+library(vegan)
+library(eulerr)
+library(ggforce)
+```
+
+# Load data
+
+```{r}
+mics <- read.table("../data/mouse_microbes.txt", sep = "\t", header = T)
+meta <- read_excel("../data/Online_Service_Submission_Form_Sample_Info_and_Group_Comparison-zymo.xlsx", sheet = 2)
+```
+
+# Format
+
+```{r match samples ALWAYS RUN}
+colnames(meta) <- c("dont.use", "sample.name", "sample.type", "sample.in",
+                    "sample.concentrate", "sample.volume", "sample.hazardous")
+
+mics.numkey <- mics %>%
+  dplyr::select(sample) %>%
+  distinct() %>%
+  filter(!grepl("Neg", sample)) %>%
+  mutate(sample.number = gsub("DS.*_(.*)_R.*", "\\1", sample))
+
+meta.form <- meta %>%
+  separate(sample.name, into = c("sample.number", "mouse.line", "treatment"), remove = F) %>%
+  right_join(mics.numkey) %>%
+  dplyr::select(-dont.use)
+
+mousekey <- meta.form %>%
+  select(sample, mouse.line) %>%
+  mutate(mouse.line = tolower(mouse.line))
+
+```
+
+# Distance calculations
+
+```{r}
+mics.stool <- mics %>%
+  filter(grepl("002_S", sample))
+
+distances <- mics.stool %>%
+  column_to_rownames(var = "sample") %>%
+  vegdist(method = "bray") %>%
+  as.matrix() %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "samp1") %>%
+  pivot_longer(-samp1, names_to = "samp2", values_to = "distance") %>%
+  filter(samp1 != samp2)
+
+distances.labline <- distances %>%
+  mutate(sample = samp1) %>%
+  left_join(mousekey) %>%
+  mutate(line1 = mouse.line) %>%
+  select(-sample, -mouse.line) %>%
+  mutate(sample = samp2) %>%
+  left_join(mousekey) %>%
+  mutate(line2 = mouse.line) %>%
+  select(-sample, -mouse.line) %>%
+  mutate(group = ifelse(line1 == line2, line1, "Cross"),
+         group = case_when(group == "balbc" ~ "BALB/c\nto BALB/c",
+                           group == "nude" ~ "Nude\nto Nude",
+                           group == "Cross" ~ "BALB/c\nto Nude"))
+```
+
+```{r}
+distances.labline %>%
+  ggplot(aes(x = group, y = distance, fill = group)) +
+  geom_boxplot(show.legend = F) +
+  labs(x = "", y = "Bray-Curtis distance") +
+  scale_fill_viridis_d(option = 1) +
+  theme_bw() +
+  theme(text = element_text(size = 9))
+ggsave("../figures/boxplot_distance-mouse-microbes.png", height = 3, width = 2)
+```
+
+# Venn diagram 
+
+```{r}
+mics.mouse <- mics.stool %>%
+  pivot_longer(-sample, names_to = "microbe", values_to = "counts") %>%
+  filter(counts != 0) %>%
+  left_join(mousekey) %>%
+  select(microbe, mouse.line) %>%
+  distinct()
+
+balbc.mics <- subset(mics.mouse$microbe, mics.mouse$mouse.line == "balbc")
+nude.mics <- subset(mics.mouse$microbe, mics.mouse$mouse.line == "nude")
+
+mouse.mic.ls <- list(Balbc = balbc.mics,
+                     Nude = nude.mics)
+```
+
+```{r}
+euler.dat <- euler(mouse.mic.ls)
+
+plot(euler.dat)
+```
+
+```{r}
+# png("../figures/euler_mouseline-microbes.png")
+# plot(euler.dat)
+# dev.off()
+```
+
+```{r}
+euler.ggdat <- euler.dat$ellipses %>%
+  rownames_to_column(var = "mouseline")
+euler.numdat <- euler.dat$original.values %>%
+  as.data.frame()
+euler.numdat$horiz <- c(-35,35,0)
+euler.numdat$vert <- c(25,-25,0)
+euler.numdat$labs <- paste(c("BALB/c\n", "Nude\n", ""), euler.numdat$.)
+
+euler.ggdat %>%
+  ggplot(aes(fill = mouseline)) +
+  geom_ellipse(aes(x0 = h, y0 = k, a =a,b=b, angle = phi), alpha = .4, show.legend = F) +
+  geom_label(data = euler.numdat, aes(x = horiz, y = vert, label = labs), inherit.aes = F) +
+  scale_fill_viridis_d(option = 3) +
+  theme_void() +
+  theme(text = element_text(size = 9))
+ggsave("../figures/euler_mouseline-microbes.png", height = 3, width = 2)
+```
+
+
+
+
+
+
