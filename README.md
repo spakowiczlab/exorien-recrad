@@ -1,4 +1,4 @@
-# exorien-recrad
+# exorien-recrad [![DOI](https://zenodo.org/badge/802177544.svg)](https://zenodo.org/doi/10.5281/zenodo.11223196)
 Code for processing and analyses associated with publication:
 
 > ## The tumor microbiome reacts to hypoxia and can influence response to radiation treatment in colorectal cancer
